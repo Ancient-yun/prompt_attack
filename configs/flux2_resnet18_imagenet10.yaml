@@ -16,7 +16,7 @@ generator:
   height: 512
   width: 512
   guidance_scale: 4.0
-  num_inference_steps: 4
+  num_inference_steps: 8
   use_cpu_offload: false
   gradient_checkpointing: true
 

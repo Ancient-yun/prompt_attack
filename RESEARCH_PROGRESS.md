@@ -682,13 +682,13 @@ This increases the conditioning capacity of the attack.
 
 ### 12.3 Increase Denoising Steps
 
-Current:
+Previous:
 
 ```yaml
 num_inference_steps: 4
 ```
 
-Next:
+Current:
 
 ```yaml
 num_inference_steps: 8
@@ -1225,7 +1225,7 @@ generator:
   precision: bf16
   height: 512
   width: 512
-  num_inference_steps: 4
+  num_inference_steps: 8
 ```
 
 Important caveat:

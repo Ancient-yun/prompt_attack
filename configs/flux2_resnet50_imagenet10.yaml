@@ -1,0 +1,83 @@
+data:
+  imagenet_root: /data/imagenet
+  split:
+  class_mode: csv_images
+  images_per_class: 10
+  clean_correct_only: true
+  candidate_multiplier: 5
+
+generator:
+  name: flux2_klein_4b
+  model_id: black-forest-labs/FLUX.2-klein-4B
+  precision: bf16
+  batch_size: 1
+  seed_per_image: true
+  memory_mode: vram24
+  height: 512
+  width: 512
+  guidance_scale: 4.0
+  num_inference_steps: 4
+  use_cpu_offload: false
+  gradient_checkpointing: true
+
+victim:
+  name: resnet18
+  weights: IMAGENET1K_V1
+
+semantic:
+  name: dinov2_vitb14
+  feature: cls
+
+attack:
+  num_soft_tokens: 8
+  soft_token_dim:
+  lr: 1.0e-2
+  lr_scheduler:
+    name: cosine
+    warmup_steps: 5
+    min_lr: 1.0e-4
+  steps: 100
+  lambda_sem: 0.5
+  semantic_threshold: 0.85
+  objective: negative_cross_entropy
+
+output:
+  root: outputs/flux2_klein_4b_lambda0.5_cosine_negce_gs4_fid_iqa_max50
+  save_grids: true
+  save_images: true
+
+quality:
+  fid:
+    enabled: true
+    fid_root: external/pytorch_fid
+    batch_size: 50
+    dims: 2048
+    fail_on_error: false
+  nriqa:
+    enabled: true
+    metrics:
+      - nima_ava
+      - hyperiqa
+      - musiq_ava
+      - musiq_koniq
+      - tres
+    fail_on_error: false
+
+logging:
+  wandb:
+    enabled: true
+    project: prompt-soft-token-attack
+    entity:
+    name: flux2_resnet18_lambda0.5_cosine_negce_gs4_fid_iqa_max50
+    mode: offline
+    dir: outputs/wandb
+    tags:
+      - flux2
+      - resnet18
+      - imagenet-csv
+      - soft-token
+      - negce
+      - fid
+      - nriqa
+    log_every_steps: 1
+    log_images: true

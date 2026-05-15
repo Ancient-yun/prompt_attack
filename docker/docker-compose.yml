@@ -1,0 +1,27 @@
+name: promtp_attack
+
+services:
+  prompt-attack:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: prompt-attack:cuda12.8
+    working_dir: /workspace/promtp_attack
+    gpus: all
+    shm_size: "16gb"
+    stdin_open: true
+    tty: true
+    env_file:
+      - .env
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - PYTHONPATH=/workspace/promtp_attack/src
+      - TORCH_HOME=/root/.cache/torch
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ..:/workspace/promtp_attack
+      - ../dataset:/data/imagenet:ro
+      - ../.cache/huggingface:/root/.cache/huggingface
+      - ../.cache/torch:/root/.cache/torch

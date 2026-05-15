@@ -1,0 +1,10 @@
+.cache/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+outputs/
+docker/.env
+dataset/images/
+external/pytorch_fid/weights/*.pth

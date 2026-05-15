@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -30,7 +31,7 @@ class MetricSummary:
     mean_runtime_seconds: float
 
 
-def _mean_optional(rows: list[dict[str, object]], key: str) -> float | None:
+def _mean_optional(rows: Sequence[Mapping[str, object]], key: str) -> float | None:
     values = [row.get(key) for row in rows]
     numeric = [float(cast(Any, value)) for value in values if value not in {None, ""}]
     if not numeric:
@@ -38,7 +39,7 @@ def _mean_optional(rows: list[dict[str, object]], key: str) -> float | None:
     return sum(numeric) / len(numeric)
 
 
-def summarize_rows(rows: list[dict[str, object]], *, fid: float | None = None) -> MetricSummary:
+def summarize_rows(rows: Sequence[Mapping[str, object]], *, fid: float | None = None) -> MetricSummary:
     """Summarize attack rows."""
     if not rows:
         return MetricSummary(

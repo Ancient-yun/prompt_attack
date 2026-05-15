@@ -5,10 +5,11 @@ from prompt_attack.data.imagenet import FIXED_10_CLASSES
 
 
 def test_load_config() -> None:
-    config = load_config(Path("configs/flux2_resnet50_imagenet10.yaml"))
+    config = load_config(Path("configs/flux2_resnet18_imagenet10.yaml"))
     assert config.generator.name == "flux2_klein_4b"
     assert config.victim.name == "resnet18"
     assert config.attack.num_soft_tokens == 8
+    assert config.attack.soft_token_init_std == 0.02
     assert config.attack.lr_scheduler.name == "cosine"
     assert config.attack.lr_scheduler.warmup_steps == 5
     assert config.attack.lr_scheduler.min_lr == 1.0e-4
@@ -21,10 +22,11 @@ def test_load_config() -> None:
 
 
 def test_smoke_override_uses_mock() -> None:
-    config = load_config(Path("configs/flux2_resnet50_imagenet10.yaml"))
+    config = load_config(Path("configs/flux2_resnet18_imagenet10.yaml"))
     smoke = with_smoke_overrides(config, use_mock_generator=True)
     assert smoke.generator.name == "mock"
     assert smoke.attack.steps == 2
+    assert smoke.attack.soft_token_init_std == config.attack.soft_token_init_std
     assert smoke.attack.lr_scheduler.name == "cosine"
     assert not smoke.quality.fid.enabled
     assert not smoke.quality.nriqa.enabled

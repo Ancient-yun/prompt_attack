@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 
-def initialize_soft_tokens(num_tokens: int, token_dim: int, *, device: str):
+def initialize_soft_tokens(num_tokens: int, token_dim: int, *, device: str, init_std: float):
     """Create learnable soft-token embeddings."""
     import torch
 
-    values = torch.randn(num_tokens, token_dim, device=device, dtype=torch.float32) * 0.02
+    if init_std <= 0:
+        raise ValueError(f"Soft-token init std must be positive, got {init_std}.")
+    values = torch.randn(num_tokens, token_dim, device=device, dtype=torch.float32) * init_std
     return torch.nn.Parameter(values)
 
 

@@ -31,6 +31,7 @@ semantic:
 attack:
   num_soft_tokens: 8
   soft_token_dim:
+  soft_token_init_std: 0.02
   lr: 1.0e-2
   lr_scheduler:
     name: cosine

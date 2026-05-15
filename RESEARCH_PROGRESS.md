@@ -601,7 +601,7 @@ FID is computed for 3-image runs, but this should be interpreted only as a sanit
 Main config:
 
 ```text
-configs/flux2_resnet50_imagenet10.yaml
+configs/flux2_resnet18_imagenet10.yaml
 ```
 
 Important settings:
@@ -801,7 +801,7 @@ Current project structure:
 ```text
 D:\code\promtp_attack
   configs/
-    flux2_resnet50_imagenet10.yaml
+    flux2_resnet18_imagenet10.yaml
     flux2_resnet18_imagenet10_nodino.yaml
   dataset/
     images.csv
@@ -1131,7 +1131,7 @@ Import-only smoke:
 
 ```bash
 python scripts/smoke_test.py \
-  --config configs/flux2_resnet50_imagenet10.yaml \
+  --config configs/flux2_resnet18_imagenet10.yaml \
   --imports-only
 ```
 
@@ -1139,7 +1139,7 @@ Mock-generator smoke test:
 
 ```bash
 python scripts/smoke_test.py \
-  --config configs/flux2_resnet50_imagenet10.yaml \
+  --config configs/flux2_resnet18_imagenet10.yaml \
   --max-images 4
 ```
 
@@ -1147,7 +1147,7 @@ Real-generator smoke test:
 
 ```bash
 python scripts/smoke_test.py \
-  --config configs/flux2_resnet50_imagenet10.yaml \
+  --config configs/flux2_resnet18_imagenet10.yaml \
   --real-generator \
   --max-images 1
 ```
@@ -1155,8 +1155,8 @@ python scripts/smoke_test.py \
 Code quality checks:
 
 ```bash
-ruff check src scripts tests
-mypy src scripts
+ruff check .
+mypy src scripts tests
 pytest -q
 ```
 
@@ -1165,10 +1165,10 @@ pytest -q
 Main semantic-loss config:
 
 ```text
-configs/flux2_resnet50_imagenet10.yaml
+configs/flux2_resnet18_imagenet10.yaml
 ```
 
-Despite the filename, the current victim model inside the config is:
+The current victim model inside the config is:
 
 ```yaml
 victim:
@@ -1181,6 +1181,7 @@ Current main attack:
 ```yaml
 attack:
   num_soft_tokens: 8
+  soft_token_init_std: 0.02
   lr: 1.0e-2
   lr_scheduler:
     name: cosine
@@ -1203,6 +1204,7 @@ Current no-DINO attack:
 ```yaml
 attack:
   num_soft_tokens: 8
+  soft_token_init_std: 0.02
   lr: 1.0e-2
   lr_scheduler:
     name: cosine
@@ -1255,7 +1257,7 @@ Then run commands below inside the container.
 ```bash
 export WANDB_NAME=flux2_resnet18_lambda0.5_negce_max3
 python scripts/run_attack.py \
-  --config configs/flux2_resnet50_imagenet10.yaml \
+  --config configs/flux2_resnet18_imagenet10.yaml \
   --max-images 3
 ```
 
@@ -1264,7 +1266,7 @@ Recommended with log file:
 ```bash
 export WANDB_NAME=flux2_resnet18_lambda0.5_negce_max3
 python scripts/run_attack.py \
-  --config configs/flux2_resnet50_imagenet10.yaml \
+  --config configs/flux2_resnet18_imagenet10.yaml \
   --max-images 3 \
   > outputs/run_3_images_lambda0.5_negce.log 2>&1
 ```
@@ -1284,7 +1286,7 @@ python scripts/run_attack.py \
 ```bash
 export WANDB_NAME=flux2_resnet18_lambda0.5_negce_max50
 python scripts/run_attack.py \
-  --config configs/flux2_resnet50_imagenet10.yaml \
+  --config configs/flux2_resnet18_imagenet10.yaml \
   --max-images 50 \
   > outputs/run_50_images_lambda0.5_negce.log 2>&1
 ```
@@ -1294,7 +1296,7 @@ python scripts/run_attack.py \
 ```bash
 export WANDB_NAME=flux2_resnet18_lambda0.5_negce_max100
 python scripts/run_attack.py \
-  --config configs/flux2_resnet50_imagenet10.yaml \
+  --config configs/flux2_resnet18_imagenet10.yaml \
   --max-images 100 \
   > outputs/run_100_images_lambda0.5_negce.log 2>&1
 ```
@@ -1318,7 +1320,7 @@ Example 50-image main run:
 docker compose -f docker\docker-compose.yml exec -d `
   -e WANDB_NAME=flux2_resnet18_lambda0.5_negce_max50 `
   prompt-attack `
-  bash -lc "python scripts/run_attack.py --config configs/flux2_resnet50_imagenet10.yaml --max-images 50 > outputs/run_50_images_lambda0.5_negce.log 2>&1"
+  bash -lc "python scripts/run_attack.py --config configs/flux2_resnet18_imagenet10.yaml --max-images 50 > outputs/run_50_images_lambda0.5_negce.log 2>&1"
 ```
 
 ### 15.13 Monitoring a Running Experiment
@@ -1559,7 +1561,7 @@ After caching, later runs should load from:
 
 Because `guidance_scale` is ignored, do not spend more runs on guidance-scale ablation with the current generator.
 
-Recommended next implementation:
+Recommended next experiment config:
 
 ```yaml
 attack:
@@ -1571,10 +1573,8 @@ generator:
   num_inference_steps: 8
 ```
 
-This requires one small code change:
-
-- add `soft_token_init_std` to `AttackConfig`
-- pass it into `initialize_soft_tokens`
+`soft_token_init_std` is now configurable through `AttackConfig` and passed into
+`initialize_soft_tokens`.
 
 Then run:
 

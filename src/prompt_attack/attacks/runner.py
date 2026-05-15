@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from math import cos, pi
 from typing import Any
 
@@ -27,12 +27,47 @@ from prompt_attack.utils.seed import stable_image_seed
 from prompt_attack.utils.wandb_logger import WandbLogger
 
 
+@dataclass(frozen=True)
+class AttackComponents:
+    """Loaded model components shared across attack entry points."""
+
+    victim: Any
+    semantic: Any
+    generator: Any
+    quality_evaluator: NoReferenceIQAEvaluator
+
+
 class SoftTokenAttackRunner:
     """Run proposed soft-token attacks sequentially image by image."""
 
     def __init__(self, config: ExperimentConfig, *, device: str) -> None:
         self.config = config
         self.device = device
+
+    def build_components(self) -> AttackComponents:
+        """Load reusable attack models and evaluators."""
+        victim = build_victim(
+            self.config.victim.name,
+            weights=self.config.victim.weights,
+            device=self.device,
+        )
+        semantic = build_semantic_model(self.config.semantic.name, device=self.device)
+        generator = build_generator(self.config.generator, device=self.device)
+        quality_evaluator = NoReferenceIQAEvaluator(
+            self.config.quality.nriqa,
+            device=self.device,
+        )
+        if not generator.supports_gradient:
+            raise RuntimeError(
+                f"Generator '{self.config.generator.name}' does not support differentiable "
+                "generation required for soft-token optimization."
+            )
+        return AttackComponents(
+            victim=victim,
+            semantic=semantic,
+            generator=generator,
+            quality_evaluator=quality_evaluator,
+        )
 
     def _build_lr_scheduler(self, optimizer):
         import torch
@@ -75,9 +110,13 @@ class SoftTokenAttackRunner:
                 break
             if per_class[record.synset] >= self.config.data.images_per_class:
                 continue
+            if not self.config.data.clean_correct_only:
+                selected.append(record)
+                per_class[record.synset] += 1
+                continue
             image = load_image(record.path)
             result = victim.evaluate_pil(image, record.class_index)
-            if not self.config.data.clean_correct_only or result.pred == record.class_index:
+            if result.pred == record.class_index:
                 selected.append(record)
                 per_class[record.synset] += 1
         return selected
@@ -102,35 +141,15 @@ class SoftTokenAttackRunner:
         logger = WandbLogger(self.config)
         logger.start()
         try:
-            victim = build_victim(
-                self.config.victim.name,
-                weights=self.config.victim.weights,
-                device=self.device,
-            )
-            semantic = build_semantic_model(self.config.semantic.name, device=self.device)
-            generator = build_generator(self.config.generator, device=self.device)
-            quality_evaluator = NoReferenceIQAEvaluator(
-                self.config.quality.nriqa,
-                device=self.device,
-            )
-            if not generator.supports_gradient:
-                raise RuntimeError(
-                    f"Generator '{self.config.generator.name}' is inference-only in this scaffold. "
-                    "Run scripts/smoke_test.py for a differentiable mock attack path, then implement "
-                    "the FLUX.2 soft-token conditioning hook before the full run."
-                )
-
-            records = self.prepare_records(victim, max_records=max_images)
+            components = self.build_components()
+            records = self.prepare_records(components.victim, max_records=max_images)
             if max_images is not None:
                 records = records[:max_images]
             rows: list[dict[str, Any]] = []
             for image_index, record in enumerate(tqdm(records, desc="attack")):
-                row = self._attack_one(
+                row = self.attack_one(
                     record,
-                    victim,
-                    semantic,
-                    generator,
-                    quality_evaluator=quality_evaluator,
+                    components,
                     logger=logger,
                     image_index=image_index,
                 )
@@ -145,19 +164,21 @@ class SoftTokenAttackRunner:
         finally:
             logger.finish()
 
-    def _attack_one(
+    def attack_one(
         self,
         record: ImageRecord,
-        victim,
-        semantic,
-        generator,
+        components: AttackComponents,
         *,
-        quality_evaluator: NoReferenceIQAEvaluator | None = None,
         logger: WandbLogger | None = None,
         image_index: int = 0,
     ) -> dict[str, Any]:
+        """Run the configured attack on one image record."""
         import torch
 
+        victim = components.victim
+        semantic = components.semantic
+        generator = components.generator
+        quality_evaluator = components.quality_evaluator
         started_at = time.perf_counter()
         image = load_image(record.path)
         original_tensor = pil_to_tensor(image, device=self.device)
@@ -175,6 +196,7 @@ class SoftTokenAttackRunner:
             self.config.attack.num_soft_tokens,
             token_dim,
             device=self.device,
+            init_std=self.config.attack.soft_token_init_std,
         )
         if not soft_tokens.requires_grad:
             raise RuntimeError("Soft-token parameter must require gradients.")
@@ -313,6 +335,7 @@ class SoftTokenAttackRunner:
             "seed": seed,
             "prompt_text": prompt,
             "num_soft_tokens": self.config.attack.num_soft_tokens,
+            "soft_token_init_std": self.config.attack.soft_token_init_std,
             "lr": self.config.attack.lr,
             "lr_scheduler": self.config.attack.lr_scheduler.name,
             "lr_warmup_steps": self.config.attack.lr_scheduler.warmup_steps,

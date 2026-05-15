@@ -12,10 +12,6 @@ import torch
 
 from prompt_attack.attacks.runner import SoftTokenAttackRunner
 from prompt_attack.config import DataConfig, OutputConfig, load_config
-from prompt_attack.data.imagenet import build_candidate_records
-from prompt_attack.generators.factory import build_generator
-from prompt_attack.models.semantic import build_semantic_model
-from prompt_attack.models.victim import build_victim
 from prompt_attack.utils.io import ensure_dir, write_json
 
 
@@ -71,17 +67,17 @@ def main() -> None:
     }
 
     t0 = time.perf_counter()
-    victim = build_victim(config.victim.name, weights=config.victim.weights, device=args.device)
-    semantic = build_semantic_model(config.semantic.name, device=args.device)
-    generator = build_generator(config.generator, device=args.device)
+    runner = SoftTokenAttackRunner(config, device=args.device)
+    components = runner.build_components()
     timings["setup_seconds"] = time.perf_counter() - t0
 
-    records = build_candidate_records(config.data)[: args.max_images]
+    record_t0 = time.perf_counter()
+    records = runner.prepare_records(components.victim, max_records=args.max_images)
+    timings["record_selection_seconds"] = time.perf_counter() - record_t0
     if records:
         load_t0 = time.perf_counter()
-        timings["soft_token_dim"] = generator.soft_token_dim(records[0].class_label)
+        timings["soft_token_dim"] = components.generator.soft_token_dim(records[0].class_label)
         timings["generator_load_seconds"] = time.perf_counter() - load_t0
-    runner = SoftTokenAttackRunner(config, device=args.device)
 
     if torch.cuda.is_available() and args.device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
@@ -89,7 +85,7 @@ def main() -> None:
     total_attack_seconds = 0.0
     for record in records:
         image_t0 = time.perf_counter()
-        row = runner._attack_one(record, victim, semantic, generator)
+        row = runner.attack_one(record, components)
         elapsed = time.perf_counter() - image_t0
         total_attack_seconds += elapsed
         images = timings["images"]

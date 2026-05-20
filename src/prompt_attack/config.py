@@ -57,7 +57,7 @@ class LRSchedulerConfig:
 @dataclass(frozen=True)
 class AttackConfig:
     num_soft_tokens: int = 8
-    soft_token_dim: int | None = None
+    soft_token_initializer: str = "object"
     soft_token_init_std: float = 0.02
     lr: float = 1.0e-2
     steps: int = 100
@@ -162,7 +162,6 @@ def load_config(path: Path) -> ExperimentConfig:
         lr_scheduler_raw = {}
     if not isinstance(lr_scheduler_raw, dict):
         raise ValueError("Config field 'attack.lr_scheduler' must be a mapping.")
-    soft_token_dim_raw = attack_raw.get("soft_token_dim")
     wandb_tags_raw = wandb_raw.get("tags", ())
     if wandb_tags_raw is None:
         wandb_tags_raw = ()
@@ -220,7 +219,7 @@ def load_config(path: Path) -> ExperimentConfig:
         ),
         attack=AttackConfig(
             num_soft_tokens=int(attack_raw.get("num_soft_tokens", 8)),
-            soft_token_dim=None if soft_token_dim_raw is None else int(soft_token_dim_raw),
+            soft_token_initializer=str(attack_raw.get("soft_token_initializer", "object")),
             soft_token_init_std=float(attack_raw.get("soft_token_init_std", 0.02)),
             lr=float(attack_raw.get("lr", 1.0e-2)),
             steps=int(attack_raw.get("steps", 100)),
@@ -304,7 +303,7 @@ def with_smoke_overrides(config: ExperimentConfig, *, use_mock_generator: bool) 
         semantic=config.semantic,
         attack=AttackConfig(
             num_soft_tokens=config.attack.num_soft_tokens,
-            soft_token_dim=config.attack.soft_token_dim,
+            soft_token_initializer=config.attack.soft_token_initializer,
             soft_token_init_std=config.attack.soft_token_init_std,
             lr=config.attack.lr,
             steps=2,

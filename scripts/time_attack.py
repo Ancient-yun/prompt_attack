@@ -76,8 +76,15 @@ def main() -> None:
     timings["record_selection_seconds"] = time.perf_counter() - record_t0
     if records:
         load_t0 = time.perf_counter()
-        timings["soft_token_dim"] = components.generator.soft_token_dim(records[0].class_label)
-        timings["generator_load_seconds"] = time.perf_counter() - load_t0
+        prompt_state = components.generator.create_learnable_prompt(
+            class_label=records[0].class_label,
+            num_tokens=config.attack.num_soft_tokens,
+            initializer=config.attack.soft_token_initializer,
+            init_std=config.attack.soft_token_init_std,
+        )
+        timings["learnable_token_count"] = len(prompt_state.token_texts)
+        timings["learnable_prompt_text"] = prompt_state.prompt_text
+        timings["generator_prompt_setup_seconds"] = time.perf_counter() - load_t0
 
     if torch.cuda.is_available() and args.device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()

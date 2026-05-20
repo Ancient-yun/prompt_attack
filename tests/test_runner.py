@@ -13,7 +13,7 @@ class RaisingVictim:
 
 
 def test_clean_correct_filter_skips_victim_when_disabled() -> None:
-    config = load_config(Path("configs/flux2_resnet18_imagenet10.yaml"))
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
     config = replace(
         config,
         data=replace(config.data, clean_correct_only=False, images_per_class=1),

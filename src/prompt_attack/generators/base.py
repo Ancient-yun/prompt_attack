@@ -14,19 +14,38 @@ class GenerationResult:
     pil_image: Image.Image
 
 
+@dataclass(frozen=True)
+class LearnablePrompt:
+    """Prompt text plus the small trainable embedding state it contains."""
+
+    prompt_text: str
+    token_texts: tuple[str, ...]
+    token_ids: tuple[int, ...]
+    learnable_embeddings: object
+
+
 class EditableGenerator(Protocol):
     supports_gradient: bool
 
-    def soft_token_dim(self, class_label: str) -> int:
-        """Return the conditioning dimension expected by this generator."""
+    def create_learnable_prompt(
+        self,
+        *,
+        class_label: str,
+        num_tokens: int,
+        initializer: str,
+        init_std: float,
+    ) -> LearnablePrompt:
+        """Create prompt text and trainable token embeddings for one attack."""
+
+    def sync_learnable_prompt(self, prompt_state: LearnablePrompt) -> None:
+        """Synchronize generator-owned token rows after optimizer updates."""
 
     def generate(
         self,
         *,
         input_image: Image.Image,
         input_tensor: object,
-        prompt: str,
-        soft_tokens: object,
+        prompt_state: LearnablePrompt,
         seed: int,
         require_grad: bool,
     ) -> GenerationResult:

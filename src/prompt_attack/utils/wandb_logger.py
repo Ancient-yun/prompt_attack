@@ -60,7 +60,7 @@ class WandbLogger:
         mode = cast(WandbMode, mode_raw)
         project = os.environ.get("WANDB_PROJECT") or wandb_config.project
         entity = os.environ.get("WANDB_ENTITY") or wandb_config.entity
-        name = os.environ.get("WANDB_NAME") or wandb_config.name
+        name = wandb_config.name or os.environ.get("WANDB_NAME")
 
         self._wandb = wandb
         self._run = wandb.init(

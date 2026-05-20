@@ -1,24 +1,22 @@
-"""Learnable soft token initialization."""
+"""Learnable textual-inversion token prompt helpers."""
 
 from __future__ import annotations
 
 
-def initialize_soft_tokens(num_tokens: int, token_dim: int, *, device: str, init_std: float):
-    """Create learnable soft-token embeddings."""
-    import torch
-
+def validate_token_init_std(init_std: float) -> None:
+    """Validate the noise scale used for learnable token initialization."""
     if init_std <= 0:
         raise ValueError(f"Soft-token init std must be positive, got {init_std}.")
-    values = torch.randn(num_tokens, token_dim, device=device, dtype=torch.float32) * init_std
-    return torch.nn.Parameter(values)
+
+
+def build_token_texts(num_tokens: int) -> tuple[str, ...]:
+    """Return the fixed textual-inversion token strings for an attack."""
+    if num_tokens <= 0:
+        raise ValueError(f"num_soft_tokens must be positive, got {num_tokens}.")
+    return tuple(f"<v{i + 1}>" for i in range(num_tokens))
 
 
 def build_prompt(class_label: str, num_tokens: int) -> str:
-    """Build the visible prompt string used for logging.
-
-    The actual FLUX.2 path passes continuous prompt embeddings directly. The
-    human-readable placeholders are kept only so each run records the intended
-    soft-token layout with the class label at the end.
-    """
-    tokens = " ".join(f"[V{i + 1}]" for i in range(num_tokens))
+    """Build the prompt string that goes through the tokenizer."""
+    tokens = " ".join(build_token_texts(num_tokens))
     return f"{tokens} a photo of {class_label}"

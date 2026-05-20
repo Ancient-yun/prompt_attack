@@ -15,8 +15,8 @@ generator:
   memory_mode: vram24
   height: 512
   width: 512
-  guidance_scale: 4.0
-  num_inference_steps: 8
+  guidance_scale: 1.0
+  num_inference_steps: 4
   use_cpu_offload: false
   gradient_checkpointing: true
 
@@ -29,8 +29,8 @@ semantic:
   feature: cls
 
 attack:
-  num_soft_tokens: 8
-  soft_token_dim:
+  num_soft_tokens: 16
+  soft_token_initializer: object
   soft_token_init_std: 0.02
   lr: 1.0e-2
   lr_scheduler:
@@ -38,12 +38,12 @@ attack:
     warmup_steps: 5
     min_lr: 1.0e-4
   steps: 100
-  lambda_sem: 0.5
+  lambda_sem: 0.0
   semantic_threshold: 0.85
-  objective: negative_cross_entropy
+  objective: cr
 
 output:
-  root: outputs/flux2_klein_4b_lambda0.5_cosine_negce_gs4_fid_iqa_max50
+  root: outputs/flux2_klein_4b_cr_gs1_steps100_tokens16_max3
   save_grids: true
   save_images: true
 
@@ -69,15 +69,15 @@ logging:
     enabled: true
     project: prompt-soft-token-attack
     entity:
-    name: flux2_resnet18_lambda0.5_cosine_negce_gs4_fid_iqa_max50
-    mode: offline
+    name: flux2_resnet18_cr_gs1_steps100_tokens16_max3
+    mode: online
     dir: outputs/wandb
     tags:
       - flux2
       - resnet18
       - imagenet-csv
       - soft-token
-      - negce
+      - cr
       - fid
       - nriqa
     log_every_steps: 1

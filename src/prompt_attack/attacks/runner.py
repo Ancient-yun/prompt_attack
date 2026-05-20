@@ -10,8 +10,12 @@ from typing import Any
 
 from tqdm import tqdm
 
-from prompt_attack.attacks.losses import attack_loss_from_objective, dino_loss
-from prompt_attack.attacks.soft_tokens import build_prompt, initialize_soft_tokens
+from prompt_attack.attacks.losses import (
+    attack_semantic_loss_weights,
+    attack_loss_from_objective,
+    dino_loss,
+    weighted_attack_semantic_loss,
+)
 from prompt_attack.config import ExperimentConfig
 from prompt_attack.data.imagenet import ImageRecord, build_candidate_records, load_image
 from prompt_attack.generators.factory import build_generator
@@ -180,27 +184,26 @@ class SoftTokenAttackRunner:
         generator = components.generator
         quality_evaluator = components.quality_evaluator
         started_at = time.perf_counter()
+        attack_loss_weight, semantic_loss_weight = attack_semantic_loss_weights(
+            self.config.attack.objective,
+            self.config.attack.lambda_sem,
+        )
         image = load_image(record.path)
         original_tensor = pil_to_tensor(image, device=self.device)
         clean_logits = victim.logits_from_tensor(original_tensor)
         clean_eval = victim.evaluate_logits(clean_logits, record.class_index)
-        prompt = build_prompt(record.class_label, self.config.attack.num_soft_tokens)
-        expected_dim = generator.soft_token_dim(prompt)
-        token_dim = self.config.attack.soft_token_dim or expected_dim
-        if token_dim != expected_dim:
-            raise ValueError(
-                f"Configured soft_token_dim={token_dim} does not match generator "
-                f"conditioning dim={expected_dim} for '{prompt}'."
-            )
-        soft_tokens = initialize_soft_tokens(
-            self.config.attack.num_soft_tokens,
-            token_dim,
-            device=self.device,
+        prompt_state = generator.create_learnable_prompt(
+            class_label=record.class_label,
+            num_tokens=self.config.attack.num_soft_tokens,
+            initializer=self.config.attack.soft_token_initializer,
             init_std=self.config.attack.soft_token_init_std,
         )
-        if not soft_tokens.requires_grad:
+        learnable_embeddings = prompt_state.learnable_embeddings
+        if not isinstance(learnable_embeddings, torch.Tensor):
+            raise TypeError("Generator prompt state must expose torch.Tensor learnable embeddings.")
+        if not learnable_embeddings.requires_grad:
             raise RuntimeError("Soft-token parameter must require gradients.")
-        optimizer = torch.optim.Adam([soft_tokens], lr=self.config.attack.lr)
+        optimizer = torch.optim.Adam([learnable_embeddings], lr=self.config.attack.lr)
         lr_scheduler = self._build_lr_scheduler(optimizer)
         seed = stable_image_seed(0, record.image_id)
         best: dict[str, Any] | None = None
@@ -216,8 +219,7 @@ class SoftTokenAttackRunner:
             generated = generator.generate(
                 input_image=image,
                 input_tensor=original_tensor,
-                prompt=prompt,
-                soft_tokens=soft_tokens,
+                prompt_state=prompt_state,
                 seed=seed,
                 require_grad=True,
             )
@@ -229,16 +231,21 @@ class SoftTokenAttackRunner:
             )
             dino_sim = None
             sem_loss = None
-            if self.config.attack.lambda_sem > 0:
+            if semantic_loss_weight > 0:
                 dino_sim = semantic.similarity(original_tensor, generated.image_tensor)
                 sem_loss = dino_loss(dino_sim)
-                total_loss = attack_loss + self.config.attack.lambda_sem * sem_loss
+                total_loss = weighted_attack_semantic_loss(
+                    attack_loss,
+                    sem_loss,
+                    self.config.attack.lambda_sem,
+                )
             else:
                 total_loss = attack_loss
             if not torch.isfinite(total_loss):
                 raise FloatingPointError(f"Non-finite loss for {record.image_id} at step {step}")
             total_loss.backward()
             optimizer.step()
+            generator.sync_learnable_prompt(prompt_state)
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
@@ -279,6 +286,8 @@ class SoftTokenAttackRunner:
                         "attack_loss": current["attack_loss"],
                         "attack_objective_loss": current["attack_loss"],
                         "semantic_loss": current["dino_loss"],
+                        "attack_loss_weight": attack_loss_weight,
+                        "semantic_loss_weight": semantic_loss_weight,
                         "total_loss": current["total_loss"],
                         "lr": current_lr,
                         "true_conf": current["adv_true_conf"],
@@ -333,15 +342,19 @@ class SoftTokenAttackRunner:
             "class_label": record.class_label,
             "run_name": self.config.generator.name,
             "seed": seed,
-            "prompt_text": prompt,
+            "prompt_text": prompt_state.prompt_text,
             "num_soft_tokens": self.config.attack.num_soft_tokens,
+            "soft_token_initializer": self.config.attack.soft_token_initializer,
             "soft_token_init_std": self.config.attack.soft_token_init_std,
+            "learnable_token_texts": " ".join(prompt_state.token_texts),
             "lr": self.config.attack.lr,
             "lr_scheduler": self.config.attack.lr_scheduler.name,
             "lr_warmup_steps": self.config.attack.lr_scheduler.warmup_steps,
             "lr_min": self.config.attack.lr_scheduler.min_lr,
             "steps": self.config.attack.steps,
             "lambda_sem": self.config.attack.lambda_sem,
+            "attack_loss_weight": attack_loss_weight,
+            "semantic_loss_weight": semantic_loss_weight,
             "semantic_threshold": self.config.attack.semantic_threshold,
             "objective": self.config.attack.objective,
             "generator_height": self.config.generator.height,

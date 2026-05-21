@@ -6,6 +6,7 @@
 .ruff_cache/
 __pycache__/
 *.py[cod]
+*.egg-info/
 outputs/
 docker/.env
 dataset/images/

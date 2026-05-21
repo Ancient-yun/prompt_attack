@@ -140,12 +140,37 @@ def build_csv_image_records(config: DataConfig) -> list[ImageRecord]:
     return records
 
 
+def build_imagenet_folder_records(config: DataConfig) -> list[ImageRecord]:
+    """Build records from an ImageNet split laid out as split/{synset}/*.JPEG."""
+    root = split_dir(config)
+    indices = class_index_map(root)
+    categories = imagenet_categories()
+    records: list[ImageRecord] = []
+    max_candidates = config.images_per_class * max(config.candidate_multiplier, 1)
+
+    for synset, class_idx in sorted(indices.items(), key=lambda item: item[1]):
+        class_dir = root / synset
+        for image_path in list_class_images(class_dir)[:max_candidates]:
+            records.append(
+                ImageRecord(
+                    path=image_path,
+                    synset=synset,
+                    class_label=categories[class_idx],
+                    class_index=class_idx,
+                    image_id=image_path.stem,
+                )
+            )
+    return records
+
+
 def build_candidate_records(config: DataConfig) -> list[ImageRecord]:
     """Build candidate records before clean-correct filtering."""
     if config.class_mode == "fixed_10":
         return build_fixed_10_records(config)
     if config.class_mode == "csv_images":
         return build_csv_image_records(config)
+    if config.class_mode == "imagenet_folder":
+        return build_imagenet_folder_records(config)
     raise ValueError(f"Unsupported class_mode: {config.class_mode}")
 
 

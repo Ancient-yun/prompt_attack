@@ -130,7 +130,7 @@ The main environment is Docker with CUDA. Host and container paths used in this 
 ```text
 Host repository:     D:\code\promtp_attack
 Container repo:     /workspace/promtp_attack
-Host dataset mount: D:\code\promtp_attack\dataset
+Host dataset mount: E:\ImageNet
 Container dataset:  /data/imagenet
 ```
 
@@ -156,6 +156,7 @@ WANDB_MODE=online
 WANDB_PROJECT=prompt-soft-token-attack
 WANDB_ENTITY=
 HF_TOKEN=
+IMAGENET_HOST_ROOT=E:/ImageNet
 ```
 
 Do not commit `docker/.env`.
@@ -167,22 +168,31 @@ The current main config uses:
 ```yaml
 data:
   imagenet_root: /data/imagenet
-  split:
-  class_mode: csv_images
+  split: train
+  class_mode: imagenet_folder
 ```
 
-With `class_mode: csv_images`, the loader expects:
+With `class_mode: imagenet_folder`, the loader expects ImageNet-1K folder splits:
 
 ```text
-/data/imagenet/images.csv
-/data/imagenet/images/{ImageId}.png
+/data/imagenet/train/{synset}/*.JPEG
+/data/imagenet/val/{synset}/*.JPEG
 ```
 
-`images.csv` must include `ImageId` and `TrueLabel`. `TrueLabel` is 1-indexed ImageNet-1K class
-ID and is converted to a torchvision 0-indexed class ID internally.
+The Docker compose file maps `${IMAGENET_HOST_ROOT:-E:/ImageNet}` to `/data/imagenet:ro`.
+`E:\ImageNet` has been checked as an ImageNet-1K folder dataset: 1000 train class dirs, 1000 val
+class dirs, 1,281,167 train images, 50,000 val images, no zero-byte files, matching synsets, and
+successful val decode verification.
 
-The runner can also load `fixed_10` ImageNet synset directories, but the current experiments use
-the CSV image set.
+The runner can still load `csv_images` datasets for NIPS2017-style CSV experiments. In that mode,
+the loader expects `images.csv` with `ImageId,TrueLabel` and an `images/{ImageId}.png` directory.
+
+Dataset verification:
+
+```powershell
+python scripts\check_imagenet_dataset.py --root E:\ImageNet
+python scripts\check_imagenet_dataset.py --root E:\ImageNet --verify-images sample --sample-size 10000
+```
 
 ## Main Commands
 
@@ -257,6 +267,11 @@ The config name now takes precedence over a stale `WANDB_NAME` environment varia
 `configs/flux2_resnet18.yaml` currently represents the main continuation point:
 
 ```yaml
+data:
+  imagenet_root: /data/imagenet
+  split: train
+  class_mode: imagenet_folder
+
 generator:
   name: flux2_klein_4b
   model_id: black-forest-labs/FLUX.2-klein-4B

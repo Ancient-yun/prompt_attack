@@ -1,6 +1,6 @@
 data:
   imagenet_root: /data/imagenet
-  split: train
+  split: val
   class_mode: imagenet_folder
   images_per_class: 10
   clean_correct_only: true
@@ -29,7 +29,7 @@ semantic:
   feature: cls
 
 attack:
-  num_soft_tokens: 16
+  num_soft_tokens: 64
   soft_token_initializer: object
   soft_token_init_std: 0.02
   lr: 1.0e-2
@@ -43,7 +43,7 @@ attack:
   objective: cr
 
 output:
-  root: outputs/flux2_klein_4b_cr_gs1_steps100_tokens16_imagenet_train
+  root: outputs/flux2_klein_4b_cr_gs1_steps100_tokens64_imagenet_val
   save_grids: true
   save_images: true
 
@@ -69,14 +69,14 @@ logging:
     enabled: true
     project: prompt-soft-token-attack
     entity:
-    name: flux2_resnet18_cr_gs1_steps100_tokens16_imagenet_train
+    name: flux2_resnet18_cr_gs1_steps100_tokens64_imagenet_val
     mode: online
     dir: outputs/wandb
     tags:
       - flux2
       - resnet18
       - imagenet-folder
-      - train
+      - val
       - soft-token
       - cr
       - fid

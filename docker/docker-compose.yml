@@ -22,6 +22,6 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       - ..:/workspace/promtp_attack
-      - ../dataset:/data/imagenet:ro
+      - ${IMAGENET_HOST_ROOT:-E:/ImageNet}:/data/imagenet:ro
       - ../.cache/huggingface:/root/.cache/huggingface
       - ../.cache/torch:/root/.cache/torch

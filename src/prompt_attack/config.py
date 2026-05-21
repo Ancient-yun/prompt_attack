@@ -57,9 +57,9 @@ class LRSchedulerConfig:
 
 @dataclass(frozen=True)
 class AttackConfig:
-    num_soft_tokens: int = 8
-    soft_token_initializer: str = "object"
-    soft_token_init_std: float = 0.02
+    num_learnable_tokens: int = 8
+    learnable_token_initializer: str = "object"
+    learnable_token_init_std: float = 0.02
     lr: float = 1.0e-2
     steps: int = 100
     lambda_sem: float = 0.5
@@ -220,9 +220,11 @@ def load_config(path: Path) -> ExperimentConfig:
             feature=str(semantic_raw.get("feature", "cls")),
         ),
         attack=AttackConfig(
-            num_soft_tokens=int(attack_raw.get("num_soft_tokens", 8)),
-            soft_token_initializer=str(attack_raw.get("soft_token_initializer", "object")),
-            soft_token_init_std=float(attack_raw.get("soft_token_init_std", 0.02)),
+            num_learnable_tokens=int(attack_raw.get("num_learnable_tokens", 8)),
+            learnable_token_initializer=str(
+                attack_raw.get("learnable_token_initializer", "object")
+            ),
+            learnable_token_init_std=float(attack_raw.get("learnable_token_init_std", 0.02)),
             lr=float(attack_raw.get("lr", 1.0e-2)),
             steps=int(attack_raw.get("steps", 100)),
             lambda_sem=float(attack_raw.get("lambda_sem", 0.5)),
@@ -304,9 +306,9 @@ def with_smoke_overrides(config: ExperimentConfig, *, use_mock_generator: bool) 
         victim=config.victim,
         semantic=config.semantic,
         attack=AttackConfig(
-            num_soft_tokens=config.attack.num_soft_tokens,
-            soft_token_initializer=config.attack.soft_token_initializer,
-            soft_token_init_std=config.attack.soft_token_init_std,
+            num_learnable_tokens=config.attack.num_learnable_tokens,
+            learnable_token_initializer=config.attack.learnable_token_initializer,
+            learnable_token_init_std=config.attack.learnable_token_init_std,
             lr=config.attack.lr,
             steps=2,
             lambda_sem=config.attack.lambda_sem,

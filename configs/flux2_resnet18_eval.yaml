@@ -29,9 +29,9 @@ semantic:
   feature: cls
 
 attack:
-  num_soft_tokens: 64
-  soft_token_initializer: object
-  soft_token_init_std: 0.02
+  num_learnable_tokens: 64
+  learnable_token_initializer: object
+  learnable_token_init_std: 0.02
   lr: 1.0e-2
   lr_scheduler:
     name: cosine
@@ -67,7 +67,7 @@ quality:
 logging:
   wandb:
     enabled: true
-    project: prompt-soft-token-attack
+    project: prompt-learnable-token-attack
     entity:
     name: flux2_resnet18_cr_gs1_steps100_tokens64_imagenet_val
     mode: online
@@ -77,7 +77,7 @@ logging:
       - resnet18
       - imagenet-folder
       - val
-      - soft-token
+      - learnable-token
       - cr
       - fid
       - nriqa

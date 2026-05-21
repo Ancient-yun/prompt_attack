@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from PIL import Image
 
-from prompt_attack.attacks.soft_tokens import build_prompt, build_token_texts, validate_token_init_std
+from prompt_attack.attacks.learnable_tokens import (
+    build_prompt,
+    build_token_texts,
+    validate_token_init_std,
+)
 from prompt_attack.config import GeneratorConfig
 from prompt_attack.generators.base import GenerationResult, LearnablePrompt
 from prompt_attack.utils.image import pil_to_tensor, tensor_to_pil

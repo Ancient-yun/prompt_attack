@@ -16,9 +16,9 @@ def test_load_config() -> None:
     assert config.data.split == "train"
     assert config.data.class_mode == "imagenet_folder"
     assert config.victim.name == "resnet18"
-    assert config.attack.num_soft_tokens == 64
-    assert config.attack.soft_token_initializer == "object"
-    assert config.attack.soft_token_init_std == 0.02
+    assert config.attack.num_learnable_tokens == 64
+    assert config.attack.learnable_token_initializer == "object"
+    assert config.attack.learnable_token_init_std == 0.02
     assert config.attack.lr_scheduler.name == "cosine"
     assert config.attack.lr_scheduler.warmup_steps == 5
     assert config.attack.lr_scheduler.min_lr == 1.0e-4
@@ -53,8 +53,8 @@ def test_smoke_override_uses_mock() -> None:
     smoke = with_smoke_overrides(config, use_mock_generator=True)
     assert smoke.generator.name == "mock"
     assert smoke.attack.steps == 2
-    assert smoke.attack.soft_token_initializer == config.attack.soft_token_initializer
-    assert smoke.attack.soft_token_init_std == config.attack.soft_token_init_std
+    assert smoke.attack.learnable_token_initializer == config.attack.learnable_token_initializer
+    assert smoke.attack.learnable_token_init_std == config.attack.learnable_token_init_std
     assert smoke.attack.lr_scheduler.name == "cosine"
     assert not smoke.quality.fid.enabled
     assert not smoke.quality.nriqa.enabled

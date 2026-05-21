@@ -1,10 +1,12 @@
-from pathlib import Path
-
 import pytest
 import torch
 from PIL import Image
 
-from prompt_attack.attacks.soft_tokens import build_prompt, build_token_texts, validate_token_init_std
+from prompt_attack.attacks.learnable_tokens import (
+    build_prompt,
+    build_token_texts,
+    validate_token_init_std,
+)
 from prompt_attack.config import GeneratorConfig
 from prompt_attack.generators.flux2 import Flux2Adapter
 from prompt_attack.generators.mock import MockEditableGenerator
@@ -160,7 +162,3 @@ def test_flux2_embedding_hook_routes_gradient_to_learnable_tokens() -> None:
     assert learnable_embeddings.grad is not None
     assert learnable_embeddings.grad.abs().sum() > 0
 
-
-def test_time_attack_does_not_reference_removed_soft_token_dim_api() -> None:
-    text = Path("scripts/time_attack.py").read_text(encoding="utf-8")
-    assert "soft_token_dim" not in text

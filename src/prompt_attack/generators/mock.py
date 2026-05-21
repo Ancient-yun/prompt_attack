@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from PIL import Image
 
-from prompt_attack.attacks.soft_tokens import build_prompt, build_token_texts, validate_token_init_std
+from prompt_attack.attacks.learnable_tokens import (
+    build_prompt,
+    build_token_texts,
+    validate_token_init_std,
+)
 from prompt_attack.generators.base import GenerationResult, LearnablePrompt
 from prompt_attack.utils.image import tensor_to_pil
 
@@ -62,10 +66,10 @@ class MockEditableGenerator:
         import torch
 
         del input_image, seed
-        soft_tokens = prompt_state.learnable_embeddings
-        if not isinstance(input_tensor, torch.Tensor) or not isinstance(soft_tokens, torch.Tensor):
+        learnable_tokens = prompt_state.learnable_embeddings
+        if not isinstance(input_tensor, torch.Tensor) or not isinstance(learnable_tokens, torch.Tensor):
             raise TypeError("MockEditableGenerator expects torch tensors.")
-        token_summary = torch.tanh(soft_tokens.mean(dim=0))
+        token_summary = torch.tanh(learnable_tokens.mean(dim=0))
         if token_summary.numel() < 3:
             token_summary = torch.nn.functional.pad(token_summary, (0, 3 - token_summary.numel()))
         color_shift = token_summary[:3].view(1, 3, 1, 1) * 0.08

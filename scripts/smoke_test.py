@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from prompt_attack.attacks.runner import SoftTokenAttackRunner
+from prompt_attack.attacks.runner import LearnableTokenAttackRunner
 from prompt_attack.config import load_config, with_smoke_overrides
 from prompt_attack.generators.factory import build_generator
 from prompt_attack.models.semantic import build_semantic_model
@@ -37,7 +37,7 @@ def main() -> None:
         print("imports-ok")
         return
 
-    runner = SoftTokenAttackRunner(config, device=args.device)
+    runner = LearnableTokenAttackRunner(config, device=args.device)
     rows = runner.run(max_images=args.max_images)
     print(f"smoke-ok rows={len(rows)}")
 

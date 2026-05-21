@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-from prompt_attack.attacks.runner import SoftTokenAttackRunner
+from prompt_attack.attacks.runner import LearnableTokenAttackRunner
 from prompt_attack.config import DataConfig, OutputConfig, load_config
 from prompt_attack.utils.io import ensure_dir, write_json
 
@@ -67,7 +67,7 @@ def main() -> None:
     }
 
     t0 = time.perf_counter()
-    runner = SoftTokenAttackRunner(config, device=args.device)
+    runner = LearnableTokenAttackRunner(config, device=args.device)
     components = runner.build_components()
     timings["setup_seconds"] = time.perf_counter() - t0
 
@@ -78,9 +78,9 @@ def main() -> None:
         load_t0 = time.perf_counter()
         prompt_state = components.generator.create_learnable_prompt(
             class_label=records[0].class_label,
-            num_tokens=config.attack.num_soft_tokens,
-            initializer=config.attack.soft_token_initializer,
-            init_std=config.attack.soft_token_init_std,
+            num_tokens=config.attack.num_learnable_tokens,
+            initializer=config.attack.learnable_token_initializer,
+            init_std=config.attack.learnable_token_init_std,
         )
         timings["learnable_token_count"] = len(prompt_state.token_texts)
         timings["learnable_prompt_text"] = prompt_state.prompt_text

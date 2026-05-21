@@ -2,7 +2,7 @@
 
 Last updated: 2026-05-21 KST
 
-This repository studies learnable prompt-token attacks against ImageNet classifiers through
+This repository studies learnable textual-inversion-token attacks against ImageNet classifiers through
 FLUX.2 image editing. The goal is not to hand-write adversarial prompts. The goal is to optimize
 small textual-inversion-style tokens in the generator conditioning path so that the generated image
 stays natural while the victim classifier changes its prediction.
@@ -107,7 +107,7 @@ scripts/
 src/prompt_attack/
   attacks/losses.py            CR, CR+DINO, legacy loss dispatch.
   attacks/runner.py            End-to-end image-by-image attack loop.
-  attacks/soft_tokens.py       Prompt/token text helpers.
+  attacks/learnable_tokens.py  Textual-inversion token prompt helpers.
   config.py                    YAML config dataclasses and loader.
   data/imagenet.py             ImageNet/CSV image record loading.
   generators/base.py           LearnablePrompt and generator protocol.
@@ -118,7 +118,7 @@ src/prompt_attack/
   utils/wandb_logger.py        W&B scalar/image/table logging.
 
 tests/
-  test_soft_tokens.py          Token prompt, hook, and gradient tests.
+  test_learnable_tokens.py     Token prompt, hook, and gradient tests.
   test_losses.py               Loss dispatch and weight behavior tests.
   test_wandb_logger.py         W&B naming behavior test.
 ```
@@ -153,7 +153,7 @@ docker exec -w /workspace/promtp_attack promtp_attack-prompt-attack-1 mypy src s
 ```text
 WANDB_API_KEY=...
 WANDB_MODE=online
-WANDB_PROJECT=prompt-soft-token-attack
+WANDB_PROJECT=prompt-learnable-token-attack
 WANDB_ENTITY=
 HF_TOKEN=
 IMAGENET_HOST_ROOT=E:/ImageNet
@@ -269,8 +269,9 @@ Important CSV fields:
 
 ```text
 prompt_text
-num_soft_tokens
-soft_token_initializer
+num_learnable_tokens
+learnable_token_initializer
+learnable_token_init_std
 learnable_token_texts
 objective
 lambda_sem
@@ -320,9 +321,9 @@ semantic:
   name: dinov2_vitb14
 
 attack:
-  num_soft_tokens: 64
-  soft_token_initializer: object
-  soft_token_init_std: 0.02
+  num_learnable_tokens: 64
+  learnable_token_initializer: object
+  learnable_token_init_std: 0.02
   lr: 1.0e-2
   lr_scheduler:
     name: cosine
@@ -341,8 +342,8 @@ Notes:
   unless the backend behavior is verified.
 - `num_inference_steps` is `4` for runtime control. Higher values are more expensive and did not
   become the default.
-- `num_soft_tokens` is `64` in the current main config because it is a high-capacity attack setting.
-  It is also more prone to semantic collapse than 16 or 32 tokens.
+- `num_learnable_tokens` is `64` in the current main config because it is a high-capacity attack
+  setting. It is also more prone to semantic collapse than 16 or 32 tokens.
 
 ## Experiment Notes So Far
 

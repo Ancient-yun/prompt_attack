@@ -1,4 +1,4 @@
-"""End-to-end soft-token attack runner."""
+"""End-to-end textual-inversion token attack runner."""
 
 from __future__ import annotations
 
@@ -41,8 +41,8 @@ class AttackComponents:
     quality_evaluator: NoReferenceIQAEvaluator
 
 
-class SoftTokenAttackRunner:
-    """Run proposed soft-token attacks sequentially image by image."""
+class LearnableTokenAttackRunner:
+    """Run textual-inversion token attacks sequentially image by image."""
 
     def __init__(self, config: ExperimentConfig, *, device: str) -> None:
         self.config = config
@@ -64,7 +64,7 @@ class SoftTokenAttackRunner:
         if not generator.supports_gradient:
             raise RuntimeError(
                 f"Generator '{self.config.generator.name}' does not support differentiable "
-                "generation required for soft-token optimization."
+                "generation required for learnable-token optimization."
             )
         return AttackComponents(
             victim=victim,
@@ -194,15 +194,15 @@ class SoftTokenAttackRunner:
         clean_eval = victim.evaluate_logits(clean_logits, record.class_index)
         prompt_state = generator.create_learnable_prompt(
             class_label=record.class_label,
-            num_tokens=self.config.attack.num_soft_tokens,
-            initializer=self.config.attack.soft_token_initializer,
-            init_std=self.config.attack.soft_token_init_std,
+            num_tokens=self.config.attack.num_learnable_tokens,
+            initializer=self.config.attack.learnable_token_initializer,
+            init_std=self.config.attack.learnable_token_init_std,
         )
         learnable_embeddings = prompt_state.learnable_embeddings
         if not isinstance(learnable_embeddings, torch.Tensor):
             raise TypeError("Generator prompt state must expose torch.Tensor learnable embeddings.")
         if not learnable_embeddings.requires_grad:
-            raise RuntimeError("Soft-token parameter must require gradients.")
+            raise RuntimeError("Learnable-token parameter must require gradients.")
         optimizer = torch.optim.Adam([learnable_embeddings], lr=self.config.attack.lr)
         lr_scheduler = self._build_lr_scheduler(optimizer)
         seed = stable_image_seed(0, record.image_id)
@@ -343,9 +343,9 @@ class SoftTokenAttackRunner:
             "run_name": self.config.generator.name,
             "seed": seed,
             "prompt_text": prompt_state.prompt_text,
-            "num_soft_tokens": self.config.attack.num_soft_tokens,
-            "soft_token_initializer": self.config.attack.soft_token_initializer,
-            "soft_token_init_std": self.config.attack.soft_token_init_std,
+            "num_learnable_tokens": self.config.attack.num_learnable_tokens,
+            "learnable_token_initializer": self.config.attack.learnable_token_initializer,
+            "learnable_token_init_std": self.config.attack.learnable_token_init_std,
             "learnable_token_texts": " ".join(prompt_state.token_texts),
             "lr": self.config.attack.lr,
             "lr_scheduler": self.config.attack.lr_scheduler.name,

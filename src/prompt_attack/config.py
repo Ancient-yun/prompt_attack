@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -184,8 +185,9 @@ def load_config(path: Path) -> ExperimentConfig:
         nriqa_metrics = tuple(str(metric) for metric in nriqa_metrics_raw)
 
     split_raw = data_raw.get("split", "val")
+    imagenet_root_raw = os.environ.get("PROMPT_ATTACK_IMAGENET_ROOT", data_raw["imagenet_root"])
     data = DataConfig(
-        imagenet_root=Path(str(data_raw["imagenet_root"])),
+        imagenet_root=Path(os.path.expandvars(str(imagenet_root_raw))),
         split="" if split_raw in {None, ""} else str(split_raw),
         class_mode=str(data_raw.get("class_mode", "fixed_10")),
         images_per_class=int(data_raw.get("images_per_class", 20)),

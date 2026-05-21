@@ -40,6 +40,14 @@ def test_load_eval_config_uses_imagenet_val_folder() -> None:
     assert config.output.root.name.endswith("imagenet_val")
 
 
+def test_imagenet_root_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PROMPT_ATTACK_IMAGENET_ROOT", "/tmp/b200-imagenet")
+
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+
+    assert config.data.imagenet_root == Path("/tmp/b200-imagenet")
+
+
 def test_smoke_override_uses_mock() -> None:
     config = load_config(Path("configs/flux2_resnet18.yaml"))
     smoke = with_smoke_overrides(config, use_mock_generator=True)

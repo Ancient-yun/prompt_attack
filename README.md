@@ -161,6 +161,37 @@ IMAGENET_HOST_ROOT=E:/ImageNet
 
 Do not commit `docker/.env`.
 
+### B200 uv Environment
+
+B200 does not use Docker for this project. Use the repository checkout at:
+
+```text
+/NHNHOME/WORKSPACE/0226010134_A/daeyun/prompt_attack
+```
+
+The ImageNet folder root on B200 is:
+
+```text
+/NHNHOME/WORKSPACE/0226010134_A/data/ImageNet/2012
+```
+
+Set up and verify the uv environment:
+
+```bash
+cd /NHNHOME/WORKSPACE/0226010134_A/daeyun/prompt_attack
+uv venv --python 3.12 .venv
+uv sync --extra dev --extra cuda128
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+uv run python scripts/check_imagenet_dataset.py --root /NHNHOME/WORKSPACE/0226010134_A/data/ImageNet/2012
+```
+
+Run with the same config by overriding only the dataset root:
+
+```bash
+PROMPT_ATTACK_IMAGENET_ROOT=/NHNHOME/WORKSPACE/0226010134_A/data/ImageNet/2012 \
+  uv run python scripts/run_attack.py --config configs/flux2_resnet18.yaml --device cuda --max-images 3
+```
+
 ## Dataset Mode
 
 The current main config uses:
@@ -180,6 +211,7 @@ With `class_mode: imagenet_folder`, the loader expects ImageNet-1K folder splits
 ```
 
 The Docker compose file maps `${IMAGENET_HOST_ROOT:-E:/ImageNet}` to `/data/imagenet:ro`.
+Non-Docker environments can override the YAML path with `PROMPT_ATTACK_IMAGENET_ROOT`.
 `E:\ImageNet` has been checked as an ImageNet-1K folder dataset: 1000 train class dirs, 1000 val
 class dirs, 1,281,167 train images, 50,000 val images, no zero-byte files, matching synsets, and
 successful val decode verification.

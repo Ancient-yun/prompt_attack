@@ -84,6 +84,7 @@ def test_clean_correct_filter_uses_batched_victim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(runner_module, "CLEAN_FILTER_BATCH_SIZE", 2)
+    monkeypatch.setattr(runner_module, "CLEAN_FILTER_CACHE_DIR", tmp_path / "cache")
     config = load_config(Path("configs/flux2_resnet18.yaml"))
     config = replace(
         config,
@@ -111,6 +112,40 @@ def test_clean_correct_filter_uses_batched_victim(
 
     assert [record.image_id for record in selected] == ["dummy_0", "dummy_2"]
     assert victim.batch_sizes == [2, 1]
+
+
+def test_clean_correct_filter_reuses_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner_module, "CLEAN_FILTER_BATCH_SIZE", 2)
+    monkeypatch.setattr(runner_module, "CLEAN_FILTER_CACHE_DIR", tmp_path / "cache")
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        data=replace(config.data, clean_correct_only=True, images_per_class=None),
+    )
+    records = []
+    for index in range(3):
+        image_path = tmp_path / f"cached_{index}.png"
+        Image.new("RGB", (8, 8), color=(index, index, index)).save(image_path)
+        records.append(
+            ImageRecord(
+                path=image_path,
+                synset="class_0000",
+                class_label="dummy",
+                class_index=1,
+                image_id=f"cached_{index}",
+            )
+        )
+    victim = BatchCleanVictim(predictions=[1, 0, 1])
+    runner = LearnableTokenAttackRunner(config, device="cpu")
+
+    selected = runner._clean_correct_records(records, victim)
+    cached_selected = runner._clean_correct_records(records, RaisingVictim())
+
+    assert [record.image_id for record in selected] == ["cached_0", "cached_2"]
+    assert [record.image_id for record in cached_selected] == ["cached_0", "cached_2"]
 
 
 def test_clean_correct_filter_allows_uncapped_per_class_selection() -> None:

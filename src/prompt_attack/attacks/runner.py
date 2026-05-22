@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass
@@ -37,6 +39,7 @@ from prompt_attack.utils.wandb_logger import WandbLogger
 
 
 CLEAN_FILTER_BATCH_SIZE = 512
+CLEAN_FILTER_CACHE_DIR = Path("outputs/cache/clean_correct")
 
 
 def _format_duration(seconds: float) -> str:
@@ -154,6 +157,31 @@ class LearnableTokenAttackRunner:
                 per_class[record.synset] += 1
             return selected
 
+        cache_path, cache_metadata = self._clean_correct_cache_path()
+        checked_keys, clean_keys = self._load_clean_correct_cache(
+            cache_path,
+            cache_metadata,
+        )
+        if checked_keys:
+            print(
+                "clean-correct cache loaded: "
+                f"{len(clean_keys)}/{len(checked_keys)} clean from {cache_path}",
+                flush=True,
+            )
+
+        def record_key(record: ImageRecord) -> str:
+            return f"{record.synset}/{record.image_id}"
+
+        def write_cache() -> None:
+            write_json(
+                cache_path,
+                {
+                    "metadata": cache_metadata,
+                    "checked_keys": sorted(checked_keys),
+                    "clean_keys": sorted(clean_keys),
+                },
+            )
+
         filter_batch_size = CLEAN_FILTER_BATCH_SIZE
         pending: list[ImageRecord] = []
         progress = tqdm(total=len(records), desc="clean-correct filter")
@@ -174,13 +202,18 @@ class LearnableTokenAttackRunner:
                     for image, label in zip(images, labels)
                 ]
             for record, result in zip(batch, results):
+                key = record_key(record)
+                checked_keys.add(key)
+                if result.pred == record.class_index:
+                    clean_keys.add(key)
                 if max_records is not None and len(selected) >= max_records:
-                    break
+                    continue
                 if not can_select(record):
                     continue
-                if result.pred == record.class_index:
+                if key in clean_keys:
                     selected.append(record)
                     per_class[record.synset] += 1
+            write_cache()
             progress.update(len(batch))
 
         try:
@@ -190,6 +223,13 @@ class LearnableTokenAttackRunner:
                 if not can_select(record):
                     progress.update(1)
                     continue
+                key = record_key(record)
+                if key in checked_keys:
+                    if key in clean_keys:
+                        selected.append(record)
+                        per_class[record.synset] += 1
+                    progress.update(1)
+                    continue
                 pending.append(record)
                 if len(pending) >= filter_batch_size:
                     flush_pending()
@@ -197,6 +237,45 @@ class LearnableTokenAttackRunner:
         finally:
             progress.close()
         return selected
+
+    def _clean_correct_cache_path(self) -> tuple[Path, dict[str, Any]]:
+        metadata = {
+            "imagenet_root": str(self.config.data.imagenet_root),
+            "split": self.config.data.split,
+            "class_mode": self.config.data.class_mode,
+            "images_per_class": self.config.data.images_per_class,
+            "candidate_multiplier": self.config.data.candidate_multiplier,
+            "victim_name": self.config.victim.name,
+            "victim_weights": self.config.victim.weights,
+        }
+        digest = hashlib.sha1(
+            json.dumps(metadata, sort_keys=True).encode("utf-8"),
+        ).hexdigest()[:16]
+        filename = (
+            f"{self.config.data.class_mode}_{self.config.data.split}_"
+            f"{self.config.victim.name}_{digest}.json"
+        )
+        return CLEAN_FILTER_CACHE_DIR / filename, metadata
+
+    def _load_clean_correct_cache(
+        self,
+        path: Path,
+        metadata: dict[str, Any],
+    ) -> tuple[set[str], set[str]]:
+        if not path.exists():
+            return set(), set()
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return set(), set()
+        if raw.get("metadata") != metadata:
+            return set(), set()
+        checked = raw.get("checked_keys", [])
+        clean = raw.get("clean_keys", [])
+        if not isinstance(checked, list) or not isinstance(clean, list):
+            return set(), set()
+        return set(str(key) for key in checked), set(str(key) for key in clean)
 
     def prepare_records(self, victim, *, max_records: int | None = None) -> list[ImageRecord]:
         """Build and optionally clean-correct filter records."""

@@ -3,8 +3,10 @@ from dataclasses import replace
 from pathlib import Path
 
 import torch
+import pytest
 from PIL import Image
 
+from prompt_attack.attacks import runner as runner_module
 from prompt_attack.attacks.runner import AttackComponents
 from prompt_attack.attacks.runner import LearnableTokenAttackRunner
 from prompt_attack.config import load_config
@@ -23,6 +25,34 @@ class RaisingVictim:
     def evaluate_pil(self, image: object, true_label: int) -> object:
         del image, true_label
         raise AssertionError("victim should not be evaluated when clean_correct_only is false")
+
+
+class BatchCleanVictim:
+    def __init__(self, predictions: Sequence[int]) -> None:
+        self.predictions = list(predictions)
+        self.batch_sizes: list[int] = []
+
+    def evaluate_pil_batch(
+        self,
+        images: list[Image.Image],
+        true_labels: list[int],
+    ) -> list[ClassificationResult]:
+        del true_labels
+        self.batch_sizes.append(len(images))
+        offset = sum(self.batch_sizes[:-1])
+        return [
+            ClassificationResult(
+                pred=self.predictions[offset + index],
+                pred_conf=1.0,
+                true_conf=1.0,
+                margin=1.0,
+            )
+            for index in range(len(images))
+        ]
+
+    def evaluate_pil(self, image: object, true_label: int) -> object:
+        del image, true_label
+        raise AssertionError("clean-correct filtering should use batched victim evaluation")
 
 
 def test_clean_correct_filter_skips_victim_when_disabled() -> None:
@@ -47,6 +77,40 @@ def test_clean_correct_filter_skips_victim_when_disabled() -> None:
     )
 
     assert selected == records
+
+
+def test_clean_correct_filter_uses_batched_victim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner_module, "CLEAN_FILTER_BATCH_SIZE", 2)
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        data=replace(config.data, clean_correct_only=True, images_per_class=None),
+    )
+    records = []
+    for index in range(3):
+        image_path = tmp_path / f"sample_{index}.png"
+        Image.new("RGB", (8, 8), color=(index, index, index)).save(image_path)
+        records.append(
+            ImageRecord(
+                path=image_path,
+                synset="class_0000",
+                class_label="dummy",
+                class_index=1,
+                image_id=f"dummy_{index}",
+            )
+        )
+    victim = BatchCleanVictim(predictions=[1, 0, 1])
+
+    selected = LearnableTokenAttackRunner(config, device="cpu")._clean_correct_records(
+        records,
+        victim,
+    )
+
+    assert [record.image_id for record in selected] == ["dummy_0", "dummy_2"]
+    assert victim.batch_sizes == [2, 1]
 
 
 def test_clean_correct_filter_allows_uncapped_per_class_selection() -> None:

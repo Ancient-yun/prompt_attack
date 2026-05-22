@@ -95,6 +95,23 @@ class TorchvisionImageNetVictim:
             for index, label in enumerate(true_labels)
         ]
 
+    def evaluate_pil_batch(
+        self,
+        images: list[Image.Image],
+        true_labels: list[int],
+    ) -> list[ClassificationResult]:
+        """Evaluate a batch of PIL images without gradient tracking."""
+        import torch
+
+        if len(images) != len(true_labels):
+            raise ValueError("images and true_labels must have the same length.")
+        if not images:
+            return []
+        tensor = torch.stack([self.preprocess_pil(image) for image in images], dim=0).to(self.device)
+        with torch.no_grad():
+            logits = self.model(tensor)
+        return self.evaluate_logits_batch(logits, true_labels)
+
     def evaluate_pil(self, image: Image.Image, true_label: int) -> ClassificationResult:
         """Evaluate one PIL image without gradient tracking."""
         import torch

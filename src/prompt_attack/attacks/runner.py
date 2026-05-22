@@ -36,6 +36,9 @@ from prompt_attack.utils.seed import stable_image_seed
 from prompt_attack.utils.wandb_logger import WandbLogger
 
 
+CLEAN_FILTER_BATCH_SIZE = 32
+
+
 def _format_duration(seconds: float) -> str:
     """Return a compact human-readable duration."""
     seconds = max(0, int(seconds))
@@ -136,23 +139,63 @@ class LearnableTokenAttackRunner:
     ) -> list[ImageRecord]:
         selected: list[ImageRecord] = []
         per_class: dict[str, int] = defaultdict(int)
-        for record in tqdm(records, desc="clean-correct filter"):
-            if max_records is not None and len(selected) >= max_records:
-                break
-            if (
-                self.config.data.images_per_class is not None
-                and per_class[record.synset] >= self.config.data.images_per_class
-            ):
-                continue
-            if not self.config.data.clean_correct_only:
+        cap = self.config.data.images_per_class
+
+        def can_select(record: ImageRecord) -> bool:
+            return cap is None or per_class[record.synset] < cap
+
+        if not self.config.data.clean_correct_only:
+            for record in tqdm(records, desc="clean-correct filter"):
+                if max_records is not None and len(selected) >= max_records:
+                    break
+                if not can_select(record):
+                    continue
                 selected.append(record)
                 per_class[record.synset] += 1
-                continue
-            image = load_image(record.path)
-            result = victim.evaluate_pil(image, record.class_index)
-            if result.pred == record.class_index:
-                selected.append(record)
-                per_class[record.synset] += 1
+            return selected
+
+        filter_batch_size = CLEAN_FILTER_BATCH_SIZE
+        pending: list[ImageRecord] = []
+        progress = tqdm(total=len(records), desc="clean-correct filter")
+
+        def flush_pending() -> None:
+            nonlocal pending
+            if not pending:
+                return
+            batch = pending
+            pending = []
+            images = [load_image(record.path) for record in batch]
+            labels = [record.class_index for record in batch]
+            if hasattr(victim, "evaluate_pil_batch"):
+                results = victim.evaluate_pil_batch(images, labels)
+            else:
+                results = [
+                    victim.evaluate_pil(image, label)
+                    for image, label in zip(images, labels)
+                ]
+            for record, result in zip(batch, results):
+                if max_records is not None and len(selected) >= max_records:
+                    break
+                if not can_select(record):
+                    continue
+                if result.pred == record.class_index:
+                    selected.append(record)
+                    per_class[record.synset] += 1
+            progress.update(len(batch))
+
+        try:
+            for record in records:
+                if max_records is not None and len(selected) >= max_records:
+                    break
+                if not can_select(record):
+                    progress.update(1)
+                    continue
+                pending.append(record)
+                if len(pending) >= filter_batch_size:
+                    flush_pending()
+            flush_pending()
+        finally:
+            progress.close()
         return selected
 
     def prepare_records(self, victim, *, max_records: int | None = None) -> list[ImageRecord]:

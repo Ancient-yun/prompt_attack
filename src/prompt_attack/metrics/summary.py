@@ -39,6 +39,14 @@ def _mean_optional(rows: Sequence[Mapping[str, object]], key: str) -> float | No
     return sum(numeric) / len(numeric)
 
 
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
 def summarize_rows(rows: Sequence[Mapping[str, object]], *, fid: float | None = None) -> MetricSummary:
     """Summarize attack rows."""
     if not rows:
@@ -64,8 +72,8 @@ def summarize_rows(rows: Sequence[Mapping[str, object]], *, fid: float | None = 
             fid=fid,
             mean_runtime_seconds=0.0,
         )
-    success_count = sum(1 for row in rows if bool(row["success"]))
-    semantic_success_count = sum(1 for row in rows if bool(row["semantic_constrained_success"]))
+    success_count = sum(1 for row in rows if _as_bool(row["success"]))
+    semantic_success_count = sum(1 for row in rows if _as_bool(row["semantic_constrained_success"]))
     dino = [float(cast(Any, row["dino_similarity"])) for row in rows]
     ssim = [float(cast(Any, row["ssim"])) for row in rows]
     margin = [float(cast(Any, row["margin_drop"])) for row in rows]

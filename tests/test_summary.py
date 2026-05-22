@@ -33,3 +33,35 @@ def test_summary_includes_optional_quality_metrics() -> None:
     assert summary.mean_iqa_musiq_koniq == 6.0
     assert summary.mean_iqa_tres == 7.0
     assert summary.fid == 12.5
+
+
+def test_summary_parses_csv_boolean_strings() -> None:
+    base = {
+        "dino_similarity": 0.9,
+        "ssim": 0.8,
+        "margin_drop": 1.0,
+        "confidence_drop": 0.2,
+        "pixel_l1_mean": 0.1,
+        "pixel_l2": 2.0,
+        "pixel_l2_mean": 0.2,
+        "pixel_linf": 0.3,
+        "runtime_seconds": 10.0,
+    }
+    rows = [
+        {
+            **base,
+            "success": "True",
+            "semantic_constrained_success": "False",
+        },
+        {
+            **base,
+            "success": "False",
+            "semantic_constrained_success": "False",
+        },
+    ]
+
+    summary = summarize_rows(rows)
+
+    assert summary.success_count == 1
+    assert summary.asr == 0.5
+    assert summary.semantic_constrained_success_count == 0

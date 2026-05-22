@@ -57,6 +57,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--generator", default="flux2", choices=("flux2", "mock"))
     parser.add_argument("--save-train-images", action="store_true")
+    parser.add_argument(
+        "--include-clean-incorrect",
+        action="store_true",
+        help="Include images the victim misclassifies before attack. Default excludes them.",
+    )
     parser.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     parser.add_argument("--wandb-project", default="prompt-learnable-token-attack")
     parser.add_argument("--log-images", action="store_true")
@@ -160,8 +165,8 @@ def build_stage_config(
             split=split,
             class_mode="fixed_10",
             images_per_class=images_per_class,
-            clean_correct_only=False,
-            candidate_multiplier=1,
+            clean_correct_only=not args.include_clean_incorrect,
+            candidate_multiplier=base.data.candidate_multiplier,
         ),
         generator=configured_generator(base.generator, args),
         attack=replace(
@@ -239,6 +244,7 @@ def print_run_overview(
         ("output", output_root),
         ("train records", train_records),
         ("test records", test_records),
+        ("clean-correct only", not args.include_clean_incorrect),
         ("train updates", steps),
         ("global batch", global_batch_size(args)),
         ("generator batch", args.generator_batch_size),

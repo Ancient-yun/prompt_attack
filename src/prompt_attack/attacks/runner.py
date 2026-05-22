@@ -35,6 +35,28 @@ from prompt_attack.utils.seed import stable_image_seed
 from prompt_attack.utils.wandb_logger import WandbLogger
 
 
+def _format_duration(seconds: float) -> str:
+    """Return a compact human-readable duration."""
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes:d}m{secs:02d}s"
+    return f"{secs:d}s"
+
+
+def _progress_eta(*, started_at: float, completed: int, total: int) -> tuple[float, float]:
+    """Return elapsed seconds and ETA seconds for a progress counter."""
+    elapsed = time.perf_counter() - started_at
+    if completed <= 0 or total <= 0:
+        return elapsed, 0.0
+    remaining = max(total - completed, 0)
+    eta = elapsed / completed * remaining
+    return elapsed, eta
+
+
 @dataclass(frozen=True)
 class AttackComponents:
     """Loaded model components shared across attack entry points."""
@@ -288,12 +310,15 @@ class LearnableTokenAttackRunner:
         micro_batch_size = max(1, self.config.generator.batch_size)
         batches = self._record_batches(records, batch_size=effective_batch_size)
         history: list[dict[str, Any]] = []
+        train_started_at = time.perf_counter()
 
-        for step in tqdm(
+        progress = tqdm(
             range(self.config.attack.steps),
             desc="uap-train",
             disable=not dist_context.is_rank0,
-        ):
+            dynamic_ncols=True,
+        )
+        for step in progress:
             batch = batches[step % len(batches)]
             local_batch = dist_context.shard(batch)
             optimizer.zero_grad(set_to_none=True)
@@ -379,8 +404,35 @@ class LearnableTokenAttackRunner:
                 "micro_batch_size": micro_batch_size,
                 "world_size": dist_context.world_size,
             }
+            completed_steps = step + 1
+            elapsed, eta = _progress_eta(
+                started_at=train_started_at,
+                completed=completed_steps,
+                total=self.config.attack.steps,
+            )
             if dist_context.is_rank0:
                 history.append(history_row)
+                progress.set_postfix(
+                    {
+                        "loss": f"{history_row['total_loss']:.4f}",
+                        "asr": f"{history_row['success_rate']:.3f}",
+                        "lr": f"{current_lr:.2e}",
+                        "eta": _format_duration(eta),
+                    },
+                    refresh=True,
+                )
+                progress.write(
+                    "[train] "
+                    f"step {completed_steps}/{self.config.attack.steps} "
+                    f"({completed_steps / self.config.attack.steps:.1%}) | "
+                    f"batch={history_row['batch_index'] + 1}/{len(batches)} | "
+                    f"loss={history_row['total_loss']:.4f} | "
+                    f"attack_loss={history_row['attack_loss']:.4f} | "
+                    f"asr={history_row['success_rate']:.3f} | "
+                    f"lr={current_lr:.2e} | "
+                    f"elapsed={_format_duration(elapsed)} | "
+                    f"eta={_format_duration(eta)}",
+                )
             if history_path is not None and dist_context.is_rank0:
                 append_csv_row(history_path, history_row)
             if logger is not None and dist_context.is_rank0:
@@ -408,6 +460,7 @@ class LearnableTokenAttackRunner:
         stage: str,
         metrics_path: Path | None = None,
         logger: WandbLogger | None = None,
+        show_progress: bool = True,
     ) -> list[dict[str, Any]]:
         """Evaluate a frozen universal prompt over records without optimizer updates."""
         import torch
@@ -418,7 +471,20 @@ class LearnableTokenAttackRunner:
             self.config.attack.lambda_sem,
         )
         batch_size = max(1, self.config.generator.batch_size)
-        for batch in tqdm(self._record_batches(records, batch_size=batch_size), desc=stage):
+        batches = self._record_batches(records, batch_size=batch_size)
+        eval_started_at = time.perf_counter()
+        seen = 0
+        clean_correct_count = 0
+        success_count = 0
+        clean_success_count = 0
+        semantic_success_count = 0
+        progress = tqdm(
+            batches,
+            desc=f"{stage}-eval",
+            disable=not show_progress,
+            dynamic_ncols=True,
+        )
+        for batch_index, batch in enumerate(progress):
             started_at = time.perf_counter()
             images, original_tensor, true_labels = self._load_batch_inputs(batch)
             prompt_batch = self._shared_prompt_batch(prompt_state, batch)
@@ -559,6 +625,40 @@ class LearnableTokenAttackRunner:
                 if logger is not None:
                     logger.log_image_result(row=row, original=images[index], adversarial=adv_image)
                 rows.append(row)
+                seen += 1
+                clean_correct_count += int(clean_correct)
+                success_count += int(success)
+                clean_success_count += int(clean_correct and success)
+                semantic_success_count += int(semantic_constrained_success)
+            if show_progress:
+                elapsed, eta = _progress_eta(
+                    started_at=eval_started_at,
+                    completed=batch_index + 1,
+                    total=len(batches),
+                )
+                asr = success_count / max(seen, 1)
+                clean_asr = clean_success_count / max(clean_correct_count, 1)
+                progress.set_postfix(
+                    {
+                        "images": f"{seen}/{len(records)}",
+                        "asr": f"{asr:.3f}",
+                        "clean_asr": f"{clean_asr:.3f}",
+                        "eta": _format_duration(eta),
+                    },
+                    refresh=True,
+                )
+                progress.write(
+                    f"[{stage}] "
+                    f"batch {batch_index + 1}/{len(batches)} | "
+                    f"images={seen}/{len(records)} ({seen / max(len(records), 1):.1%}) | "
+                    f"clean_correct={clean_correct_count} | "
+                    f"success={success_count} | "
+                    f"semantic_success={semantic_success_count} | "
+                    f"asr={asr:.3f} | "
+                    f"clean_asr={clean_asr:.3f} | "
+                    f"elapsed={_format_duration(elapsed)} | "
+                    f"eta={_format_duration(eta)}",
+                )
         return rows
 
     def save_universal_prompt(

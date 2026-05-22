@@ -88,6 +88,22 @@ def nvidia_smi(label: str, *, enabled: bool = True) -> None:
     print("================================\n", flush=True)
 
 
+def terminal_section(title: str) -> None:
+    line = "=" * 78
+    print(f"\n{line}\n{title}\n{line}", flush=True)
+
+
+def terminal_kv(title: str, rows: list[tuple[str, object]]) -> None:
+    terminal_section(title)
+    width = max(len(key) for key, _ in rows) if rows else 0
+    for key, value in rows:
+        print(f"{key:<{width}} : {value}", flush=True)
+
+
+def terminal_stage(index: int, total: int, title: str) -> None:
+    print(f"\n[stage {index}/{total}] {title}", flush=True)
+
+
 def run_name(args: argparse.Namespace, *, train_ipc: int | None, test_ipc: int | None) -> str:
     train_label = images_per_class_label(train_ipc)
     test_label = images_per_class_label(test_ipc)
@@ -201,6 +217,52 @@ def compute_steps(record_count: int, args: argparse.Namespace) -> int:
     return updates_per_epoch * max(1, args.epochs)
 
 
+def batch_count(record_count: int, batch_size: int) -> int:
+    return max(1, math.ceil(record_count / max(1, batch_size)))
+
+
+def print_run_overview(
+    args: argparse.Namespace,
+    *,
+    name: str,
+    output_root: Path,
+    metrics_dir: Path,
+    train_records: int,
+    test_records: int,
+    steps: int,
+    dist_context: DistributedContext,
+) -> None:
+    stages = 4 + int(args.save_train_images)
+    rows = [
+        ("run", name),
+        ("output", output_root),
+        ("train records", train_records),
+        ("test records", test_records),
+        ("train updates", steps),
+        ("global batch", global_batch_size(args)),
+        ("generator batch", args.generator_batch_size),
+        ("train batches/epoch", batch_count(train_records, global_batch_size(args))),
+        ("test eval batches", batch_count(test_records, args.generator_batch_size)),
+        (
+            "train eval batches",
+            batch_count(train_records, args.generator_batch_size) if args.save_train_images else "skipped",
+        ),
+        ("world size", dist_context.world_size),
+        ("device", dist_context.device),
+        ("wandb mode", args.wandb_mode),
+        ("stage count", stages),
+        ("history csv", metrics_dir / "train_history.csv"),
+        ("test csv", metrics_dir / "test_results.csv"),
+        ("summary json", metrics_dir / "summary.json"),
+    ]
+    terminal_kv("Fixed10 UAP Run Overview", rows)
+    print(
+        "\nProgress lines show step/batch, percent, ASR, elapsed time, and ETA. "
+        "In tmux, keep this pane open or tail the log file.",
+        flush=True,
+    )
+
+
 def read_csv_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -248,21 +310,27 @@ def main() -> None:
     name = run_name(args, train_ipc=train_ipc, test_ipc=test_ipc)
     output_root = args.root / name
     metrics_dir = output_root / "metrics"
+    stage_total = 4 + int(args.save_train_images)
     if dist_context.is_rank0:
         ensure_dir(metrics_dir)
         remove_previous_outputs(metrics_dir, dist_context=dist_context)
         os.environ["WANDB_PROJECT"] = args.wandb_project
         os.environ["WANDB_MODE"] = args.wandb_mode
-        print(f"fixed10 UAP experiment: {name}", flush=True)
-        print(f"output={output_root}", flush=True)
-        print(
-            f"distributed rank={dist_context.rank} world_size={dist_context.world_size} "
-            f"device={dist_context.device}",
-            flush=True,
+        terminal_kv(
+            "Fixed10 UAP Startup",
+            [
+                ("run", name),
+                ("output", output_root),
+                ("rank", dist_context.rank),
+                ("world size", dist_context.world_size),
+                ("device", dist_context.device),
+            ],
         )
         nvidia_smi("before uap")
     dist_context.barrier()
 
+    if dist_context.is_rank0:
+        terminal_stage(1, stage_total, "load models and select train/test records")
     train_probe_config = build_stage_config(
         args,
         split="train",
@@ -306,12 +374,25 @@ def main() -> None:
         ),
         args.test_max_images,
     )
+    if dist_context.is_rank0:
+        print_run_overview(
+            args,
+            name=name,
+            output_root=output_root,
+            metrics_dir=metrics_dir,
+            train_records=len(train_records),
+            test_records=len(test_records),
+            steps=steps,
+            dist_context=dist_context,
+        )
 
     logger = WandbLogger(train_config) if dist_context.is_rank0 else None
     started = time.perf_counter()
     if logger is not None:
         logger.start()
     try:
+        if dist_context.is_rank0:
+            terminal_stage(2, stage_total, "train shared learnable-token prompt")
         prompt_state, history = train_runner.train_universal_prompt(
             train_records,
             components,
@@ -321,6 +402,8 @@ def main() -> None:
         )
         train_rows: list[dict[str, Any]] = []
         if args.save_train_images:
+            if dist_context.is_rank0:
+                terminal_stage(3, stage_total, "frozen train-set image save/eval")
             train_rank_path = (
                 metrics_dir / f"train_results_rank{dist_context.rank}.csv"
                 if dist_context.is_distributed
@@ -333,8 +416,12 @@ def main() -> None:
                 stage="train",
                 metrics_path=train_rank_path,
                 logger=logger if not dist_context.is_distributed or dist_context.is_rank0 else None,
+                show_progress=not dist_context.is_distributed or dist_context.is_rank0,
             )
 
+        if dist_context.is_rank0:
+            test_stage = 4 if args.save_train_images else 3
+            terminal_stage(test_stage, stage_total, "frozen val/test eval")
         test_rank_path = (
             metrics_dir / f"test_results_rank{dist_context.rank}.csv"
             if dist_context.is_distributed
@@ -347,10 +434,13 @@ def main() -> None:
             stage="test",
             metrics_path=test_rank_path,
             logger=logger if not dist_context.is_distributed or dist_context.is_rank0 else None,
+            show_progress=not dist_context.is_distributed or dist_context.is_rank0,
         )
         dist_context.barrier()
 
         if dist_context.is_rank0:
+            merge_stage = 5 if args.save_train_images else 4
+            terminal_stage(merge_stage, stage_total, "merge metrics and write summary")
             if dist_context.is_distributed:
                 if args.save_train_images:
                     train_rows = merge_csv_files(

@@ -36,7 +36,7 @@ from prompt_attack.utils.seed import stable_image_seed
 from prompt_attack.utils.wandb_logger import WandbLogger
 
 
-CLEAN_FILTER_BATCH_SIZE = 2048
+CLEAN_FILTER_BATCH_SIZE = 512
 
 
 def _format_duration(seconds: float) -> str:

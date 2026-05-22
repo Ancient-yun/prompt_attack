@@ -31,6 +31,7 @@ from prompt_attack.models.victim import build_victim
 from prompt_attack.utils.distributed import DistributedContext
 from prompt_attack.utils.image import make_side_by_side, pil_to_tensor, save_image, tensor_to_pil
 from prompt_attack.utils.io import append_csv_row, ensure_dir, write_json
+from prompt_attack.utils.process_title import set_process_title
 from prompt_attack.utils.seed import stable_image_seed
 from prompt_attack.utils.wandb_logger import WandbLogger
 
@@ -412,6 +413,11 @@ class LearnableTokenAttackRunner:
             )
             if dist_context.is_rank0:
                 history.append(history_row)
+                set_process_title(
+                    f"prompt_attack uap-train {self.config.output.root.name} "
+                    f"{completed_steps}/{self.config.attack.steps} "
+                    f"asr={history_row['success_rate']:.3f} eta={_format_duration(eta)}"
+                )
                 progress.set_postfix(
                     {
                         "loss": f"{history_row['total_loss']:.4f}",
@@ -638,6 +644,10 @@ class LearnableTokenAttackRunner:
                 )
                 asr = success_count / max(seen, 1)
                 clean_asr = clean_success_count / max(clean_correct_count, 1)
+                set_process_title(
+                    f"prompt_attack {stage}-eval {self.config.output.root.name} "
+                    f"{seen}/{len(records)} asr={asr:.3f} eta={_format_duration(eta)}"
+                )
                 progress.set_postfix(
                     {
                         "images": f"{seen}/{len(records)}",

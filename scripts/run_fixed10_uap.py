@@ -29,6 +29,7 @@ from prompt_attack.metrics.fid import compute_fid_for_rows
 from prompt_attack.metrics.summary import summarize_rows
 from prompt_attack.utils.distributed import DistributedContext
 from prompt_attack.utils.io import append_csv_row, ensure_dir, write_json
+from prompt_attack.utils.process_title import set_process_title
 from prompt_attack.utils.wandb_logger import WandbLogger
 
 
@@ -311,6 +312,7 @@ def main() -> None:
     output_root = args.root / name
     metrics_dir = output_root / "metrics"
     stage_total = 4 + int(args.save_train_images)
+    set_process_title(f"prompt_attack setup {name}")
     if dist_context.is_rank0:
         ensure_dir(metrics_dir)
         remove_previous_outputs(metrics_dir, dist_context=dist_context)
@@ -331,6 +333,7 @@ def main() -> None:
 
     if dist_context.is_rank0:
         terminal_stage(1, stage_total, "load models and select train/test records")
+        set_process_title(f"prompt_attack load-records {name}")
     train_probe_config = build_stage_config(
         args,
         split="train",
@@ -393,6 +396,7 @@ def main() -> None:
     try:
         if dist_context.is_rank0:
             terminal_stage(2, stage_total, "train shared learnable-token prompt")
+            set_process_title(f"prompt_attack train-start {name}")
         prompt_state, history = train_runner.train_universal_prompt(
             train_records,
             components,
@@ -404,6 +408,7 @@ def main() -> None:
         if args.save_train_images:
             if dist_context.is_rank0:
                 terminal_stage(3, stage_total, "frozen train-set image save/eval")
+                set_process_title(f"prompt_attack train-eval-start {name}")
             train_rank_path = (
                 metrics_dir / f"train_results_rank{dist_context.rank}.csv"
                 if dist_context.is_distributed
@@ -422,6 +427,7 @@ def main() -> None:
         if dist_context.is_rank0:
             test_stage = 4 if args.save_train_images else 3
             terminal_stage(test_stage, stage_total, "frozen val/test eval")
+            set_process_title(f"prompt_attack test-eval-start {name}")
         test_rank_path = (
             metrics_dir / f"test_results_rank{dist_context.rank}.csv"
             if dist_context.is_distributed
@@ -441,6 +447,7 @@ def main() -> None:
         if dist_context.is_rank0:
             merge_stage = 5 if args.save_train_images else 4
             terminal_stage(merge_stage, stage_total, "merge metrics and write summary")
+            set_process_title(f"prompt_attack summarize {name}")
             if dist_context.is_distributed:
                 if args.save_train_images:
                     train_rows = merge_csv_files(
@@ -516,6 +523,7 @@ def main() -> None:
                 f"elapsed_sec={elapsed:.1f}",
                 flush=True,
             )
+            set_process_title(f"prompt_attack done {name}")
             if dist_context.is_distributed:
                 for rank in range(dist_context.world_size):
                     for prefix in ("train_results", "test_results"):

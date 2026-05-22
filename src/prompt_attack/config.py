@@ -15,7 +15,7 @@ class DataConfig:
     imagenet_root: Path
     split: str = "val"
     class_mode: str = "fixed_10"
-    images_per_class: int = 20
+    images_per_class: int | None = 20
     clean_correct_only: bool = True
     candidate_multiplier: int = 5
 
@@ -57,6 +57,8 @@ class LRSchedulerConfig:
 
 @dataclass(frozen=True)
 class AttackConfig:
+    training_mode: str = "imagewise"
+    batch_size: int = 1
     num_learnable_tokens: int = 8
     learnable_token_initializer: str = "object"
     learnable_token_init_std: float = 0.02
@@ -140,6 +142,18 @@ def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     return value
 
 
+def parse_images_per_class(value: Any, *, default: int | None = 20) -> int | None:
+    """Parse a per-class image limit, using ``None`` for all images."""
+    if value is None:
+        return default
+    if isinstance(value, str) and value.lower() == "all":
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"images_per_class must be positive or 'all', got {value!r}.")
+    return parsed
+
+
 def load_config(path: Path) -> ExperimentConfig:
     """Load an experiment config from YAML."""
     with path.open("r", encoding="utf-8") as f:
@@ -163,6 +177,9 @@ def load_config(path: Path) -> ExperimentConfig:
         lr_scheduler_raw = {}
     if not isinstance(lr_scheduler_raw, dict):
         raise ValueError("Config field 'attack.lr_scheduler' must be a mapping.")
+    training_mode = str(attack_raw.get("training_mode", "imagewise")).lower()
+    if training_mode not in {"imagewise", "universal"}:
+        raise ValueError("Config field 'attack.training_mode' must be 'imagewise' or 'universal'.")
     wandb_tags_raw = wandb_raw.get("tags", ())
     if wandb_tags_raw is None:
         wandb_tags_raw = ()
@@ -190,7 +207,7 @@ def load_config(path: Path) -> ExperimentConfig:
         imagenet_root=Path(os.path.expandvars(str(imagenet_root_raw))),
         split="" if split_raw in {None, ""} else str(split_raw),
         class_mode=str(data_raw.get("class_mode", "fixed_10")),
-        images_per_class=int(data_raw.get("images_per_class", 20)),
+        images_per_class=parse_images_per_class(data_raw.get("images_per_class", 20)),
         clean_correct_only=bool(data_raw.get("clean_correct_only", True)),
         candidate_multiplier=int(data_raw.get("candidate_multiplier", 5)),
     )
@@ -220,6 +237,8 @@ def load_config(path: Path) -> ExperimentConfig:
             feature=str(semantic_raw.get("feature", "cls")),
         ),
         attack=AttackConfig(
+            training_mode=training_mode,
+            batch_size=max(1, int(attack_raw.get("batch_size", 1))),
             num_learnable_tokens=int(attack_raw.get("num_learnable_tokens", 8)),
             learnable_token_initializer=str(
                 attack_raw.get("learnable_token_initializer", "object")
@@ -306,6 +325,8 @@ def with_smoke_overrides(config: ExperimentConfig, *, use_mock_generator: bool) 
         victim=config.victim,
         semantic=config.semantic,
         attack=AttackConfig(
+            training_mode=config.attack.training_mode,
+            batch_size=config.attack.batch_size,
             num_learnable_tokens=config.attack.num_learnable_tokens,
             learnable_token_initializer=config.attack.learnable_token_initializer,
             learnable_token_init_std=config.attack.learnable_token_init_std,

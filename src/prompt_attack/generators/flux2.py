@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from types import MethodType
+
 from PIL import Image
 
 from prompt_attack.attacks.learnable_tokens import (
@@ -10,7 +13,12 @@ from prompt_attack.attacks.learnable_tokens import (
     validate_token_init_std,
 )
 from prompt_attack.config import GeneratorConfig
-from prompt_attack.generators.base import GenerationResult, LearnablePrompt
+from prompt_attack.generators.base import (
+    GenerationBatchResult,
+    GenerationResult,
+    LearnablePrompt,
+    LearnablePromptBatch,
+)
 from prompt_attack.utils.image import pil_to_tensor, tensor_to_pil
 
 
@@ -140,6 +148,37 @@ class Flux2Adapter:
         self.sync_learnable_prompt(prompt_state)
         return prompt_state
 
+    def create_learnable_prompt_batch(
+        self,
+        *,
+        class_labels: Sequence[str],
+        num_tokens: int,
+        initializer: str,
+        init_std: float,
+    ) -> LearnablePromptBatch:
+        """Create per-sample textual-inversion tokens for a batch."""
+        import torch
+
+        if not class_labels:
+            raise ValueError("class_labels must not be empty.")
+        validate_token_init_std(init_std)
+        token_texts = build_token_texts(num_tokens)
+        token_ids = self._ensure_learnable_tokens(token_texts)
+        initializer_embedding = self._initializer_embedding(initializer)
+        base_values = initializer_embedding.to(
+            device=torch.device(self.device),
+            dtype=torch.float32,
+        ).repeat(len(class_labels), num_tokens, 1)
+        values = base_values + torch.randn_like(base_values) * init_std
+        prompt_state = LearnablePromptBatch(
+            prompt_texts=tuple(build_prompt(label, num_tokens) for label in class_labels),
+            token_texts=token_texts,
+            token_ids=token_ids,
+            learnable_embeddings=torch.nn.Parameter(values),
+        )
+        self.sync_learnable_prompt_batch(prompt_state)
+        return prompt_state
+
     def sync_learnable_prompt(self, prompt_state: LearnablePrompt) -> None:
         """Copy optimized token embeddings into the text encoder embedding rows."""
         import torch
@@ -157,7 +196,24 @@ class Flux2Adapter:
         with torch.no_grad():
             embedding_layer.weight.index_copy_(0, ids, values)
 
-    def _register_learnable_embedding_hook(self, prompt_state: LearnablePrompt):
+    def sync_learnable_prompt_batch(self, prompt_state: LearnablePromptBatch) -> None:
+        """Validate batch prompt values.
+
+        Per-sample batch values are injected row-wise by the text embedding hook. Shared
+        universal values are synchronized through ``sync_learnable_prompt``.
+        """
+        learnable_embeddings = prompt_state.learnable_embeddings
+        import torch
+
+        if not isinstance(learnable_embeddings, torch.Tensor):
+            raise TypeError("FLUX.2 prompt state must contain a torch.Tensor parameter.")
+        if learnable_embeddings.ndim not in {2, 3}:
+            raise ValueError("Batch prompt embeddings must have shape [N, D] or [B, N, D].")
+
+    def _register_learnable_embedding_hook(
+        self,
+        prompt_state: LearnablePrompt | LearnablePromptBatch,
+    ):
         """Replace only the learnable token positions in text-encoder embeddings."""
         import torch
 
@@ -176,7 +232,20 @@ class Flux2Adapter:
             for index, token_id in enumerate(prompt_state.token_ids):
                 mask = (input_ids == token_id).unsqueeze(-1)
                 if mask.any():
-                    value = replacements[index].view(*([1] * (output.ndim - 1)), output.shape[-1])
+                    if replacements.ndim == 2:
+                        value = replacements[index].view(*([1] * (output.ndim - 1)), output.shape[-1])
+                    elif replacements.ndim == 3:
+                        row_replacements = replacements
+                        if row_replacements.shape[0] != output.shape[0]:
+                            if output.shape[0] % row_replacements.shape[0] != 0:
+                                raise RuntimeError(
+                                    "Cannot align batch learnable embeddings with text encoder output."
+                                )
+                            repeats = output.shape[0] // row_replacements.shape[0]
+                            row_replacements = row_replacements.repeat_interleave(repeats, dim=0)
+                        value = row_replacements[:, index, :].unsqueeze(1)
+                    else:
+                        raise ValueError("Learnable embeddings must have shape [N, D] or [B, N, D].")
                     edited = torch.where(mask, value, edited)
             return edited
 
@@ -246,3 +315,132 @@ class Flux2Adapter:
                 generator=generator,
             ).images[0]
         return GenerationResult(image_tensor=pil_to_tensor(image, device=self.device), pil_image=image)
+
+    @staticmethod
+    def _prepare_per_sample_image_latents(pipe, images, batch_size, generator, device, dtype):
+        """Prepare one independent conditioning image per batch row.
+
+        FLUX.2 Klein treats `image=[...]` as multiple shared reference images for every prompt.
+        For attack batches we need row `i` to see only image `i`, so this method replaces the
+        pipeline's shared-reference implementation during `generate_batch`.
+        """
+        import torch
+
+        if len(images) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} conditioning images for per-sample batching, got {len(images)}."
+            )
+        image_tensors = [image.to(device=device, dtype=dtype) for image in images]
+        spatial_shapes = {tuple(image.shape[-2:]) for image in image_tensors}
+        if len(spatial_shapes) != 1:
+            raise ValueError("Per-sample FLUX.2 batching requires equal-sized conditioning images.")
+
+        image_batch = torch.cat(image_tensors, dim=0)
+        image_latents = pipe._encode_vae_image(image=image_batch, generator=generator)
+        batch_size, _, height, width = image_latents.shape
+        packed_latents = pipe._pack_latents(image_latents)
+
+        t = torch.tensor([10])
+        h = torch.arange(height)
+        w = torch.arange(width)
+        seq = torch.arange(1)
+        image_latent_ids = torch.cartesian_prod(t, h, w, seq)
+        image_latent_ids = image_latent_ids.unsqueeze(0).expand(batch_size, -1, -1).to(device)
+        return packed_latents, image_latent_ids
+
+    def _per_sample_condition_images(self, input_images: Sequence[Image.Image]) -> list[Image.Image]:
+        """Resize batch conditioning images to a common FLUX size."""
+        return [
+            image.resize(
+                (self.config.width, self.config.height),
+                Image.Resampling.LANCZOS,
+            )
+            for image in input_images
+        ]
+
+    def generate_batch(
+        self,
+        *,
+        input_images: Sequence[Image.Image],
+        input_tensor: object,
+        prompt_state: LearnablePromptBatch,
+        seeds: Sequence[int],
+        require_grad: bool,
+    ) -> GenerationBatchResult:
+        """Run FLUX.2 editing for a prompt/image batch in one pipeline call."""
+        import torch
+
+        del input_tensor
+        if len(input_images) != len(prompt_state.prompt_texts):
+            raise ValueError("input_images and prompt_texts must have the same length.")
+        if len(seeds) != len(input_images):
+            raise ValueError("seeds and input_images must have the same length.")
+        pipe = self._load_pipe()
+        generators = [torch.Generator(device=self.device).manual_seed(seed) for seed in seeds]
+        condition_images = self._per_sample_condition_images(input_images)
+        original_prepare_image_latents = pipe.prepare_image_latents
+
+        def prepare_per_sample_image_latents(pipe_self, images, batch_size, generator, device, dtype):
+            return self._prepare_per_sample_image_latents(
+                pipe_self,
+                images,
+                batch_size,
+                generator,
+                device,
+                dtype,
+            )
+
+        if require_grad:
+            hook = self._register_learnable_embedding_hook(prompt_state)
+            try:
+                pipe.prepare_image_latents = MethodType(prepare_per_sample_image_latents, pipe)
+                output = self._differentiable_call(
+                    pipe,
+                    image=condition_images,
+                    prompt=list(prompt_state.prompt_texts),
+                    height=self.config.height,
+                    width=self.config.width,
+                    guidance_scale=self.config.guidance_scale,
+                    num_inference_steps=self.config.num_inference_steps,
+                    generator=generators,
+                    output_type="pt",
+                    return_dict=True,
+                )
+            finally:
+                hook.remove()
+                pipe.prepare_image_latents = original_prepare_image_latents
+            image_tensor = output.images
+            if image_tensor.ndim == 3:
+                image_tensor = image_tensor.unsqueeze(0)
+            image_tensor = image_tensor.to(dtype=torch.float32).clamp(0, 1)
+            return GenerationBatchResult(
+                image_tensor=image_tensor,
+                pil_images=[tensor_to_pil(image_tensor[index]) for index in range(image_tensor.shape[0])],
+            )
+
+        hook = self._register_learnable_embedding_hook(prompt_state)
+        try:
+            pipe.prepare_image_latents = MethodType(prepare_per_sample_image_latents, pipe)
+            with torch.no_grad():
+                output = pipe(
+                    image=condition_images,
+                    prompt=list(prompt_state.prompt_texts),
+                    height=self.config.height,
+                    width=self.config.width,
+                    guidance_scale=self.config.guidance_scale,
+                    num_inference_steps=self.config.num_inference_steps,
+                    generator=generators,
+                    output_type="pt",
+                    return_dict=True,
+                )
+        finally:
+            hook.remove()
+            pipe.prepare_image_latents = original_prepare_image_latents
+        image_tensor = output.images
+        if image_tensor.ndim == 3:
+            image_tensor = image_tensor.unsqueeze(0)
+        image_tensor = image_tensor.to(device=self.device, dtype=torch.float32).clamp(0, 1)
+        return GenerationBatchResult(
+            image_tensor=image_tensor,
+            pil_images=[tensor_to_pil(image_tensor[index]) for index in range(image_tensor.shape[0])],
+        )

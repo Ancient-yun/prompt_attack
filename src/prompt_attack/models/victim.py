@@ -88,6 +88,13 @@ class TorchvisionImageNetVictim:
         margin = float((true_logit - other_max).detach().cpu().item())
         return ClassificationResult(pred=pred, pred_conf=pred_conf, true_conf=true_conf, margin=margin)
 
+    def evaluate_logits_batch(self, logits, true_labels) -> list[ClassificationResult]:
+        """Compute prediction, confidence, and margin for each row of logits."""
+        return [
+            self.evaluate_logits(logits[index : index + 1], int(label))
+            for index, label in enumerate(true_labels)
+        ]
+
     def evaluate_pil(self, image: Image.Image, true_label: int) -> ClassificationResult:
         """Evaluate one PIL image without gradient tracking."""
         import torch

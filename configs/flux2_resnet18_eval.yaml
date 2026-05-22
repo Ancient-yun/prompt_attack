@@ -29,6 +29,8 @@ semantic:
   feature: cls
 
 attack:
+  training_mode: imagewise
+  batch_size: 1
   num_learnable_tokens: 64
   learnable_token_initializer: object
   learnable_token_init_std: 0.02

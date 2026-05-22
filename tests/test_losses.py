@@ -22,6 +22,38 @@ def test_negative_cross_entropy_loss() -> None:
     assert torch.allclose(actual, expected)
 
 
+def test_batch_negative_cross_entropy_loss_matches_scalar_loop() -> None:
+    logits = torch.tensor([[1.0, 2.0, -1.0], [3.0, -2.0, 0.5]])
+    labels = torch.tensor([1, 2])
+
+    per_sample = negative_cross_entropy_loss(logits, labels, reduction="none")
+    expected_per_sample = torch.stack(
+        [
+            negative_cross_entropy_loss(logits[0:1], 1),
+            negative_cross_entropy_loss(logits[1:2], 2),
+        ]
+    )
+
+    assert torch.allclose(per_sample, expected_per_sample)
+    assert torch.allclose(negative_cross_entropy_loss(logits, labels), expected_per_sample.mean())
+
+
+def test_batch_margin_loss_matches_scalar_loop() -> None:
+    logits = torch.tensor([[1.0, 2.0, -1.0], [3.0, -2.0, 0.5]])
+    labels = torch.tensor([1, 2])
+
+    per_sample = untargeted_margin_loss(logits, labels, reduction="none")
+    expected_per_sample = torch.stack(
+        [
+            untargeted_margin_loss(logits[0:1], 1),
+            untargeted_margin_loss(logits[1:2], 2),
+        ]
+    )
+
+    assert torch.allclose(per_sample, expected_per_sample)
+    assert torch.allclose(untargeted_margin_loss(logits, labels), expected_per_sample.mean())
+
+
 def test_attack_loss_dispatch() -> None:
     logits = torch.tensor([[1.0, 2.0, -1.0]])
     assert torch.allclose(

@@ -1,9 +1,22 @@
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
+import torch
+from PIL import Image
+
+from prompt_attack.attacks.runner import AttackComponents
 from prompt_attack.attacks.runner import LearnableTokenAttackRunner
 from prompt_attack.config import load_config
 from prompt_attack.data.imagenet import ImageRecord
+from prompt_attack.generators.base import (
+    GenerationBatchResult,
+    GenerationResult,
+    LearnablePrompt,
+    LearnablePromptBatch,
+)
+from prompt_attack.generators.mock import MockEditableGenerator
+from prompt_attack.models.victim import ClassificationResult
 
 
 class RaisingVictim:
@@ -34,3 +47,218 @@ def test_clean_correct_filter_skips_victim_when_disabled() -> None:
     )
 
     assert selected == records
+
+
+def test_clean_correct_filter_allows_uncapped_per_class_selection() -> None:
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        data=replace(config.data, clean_correct_only=False, images_per_class=None),
+    )
+    records = [
+        ImageRecord(
+            path=Path(f"does-not-exist-{index}.png"),
+            synset="class_0000",
+            class_label="dummy",
+            class_index=0,
+            image_id=f"dummy_{index}",
+        )
+        for index in range(3)
+    ]
+
+    selected = LearnableTokenAttackRunner(config, device="cpu")._clean_correct_records(
+        records,
+        RaisingVictim(),
+    )
+
+    assert selected == records
+
+
+class CountingBatchGenerator(MockEditableGenerator):
+    def __init__(self, *, device: str) -> None:
+        super().__init__(device=device)
+        self.batch_calls = 0
+
+    def generate(
+        self,
+        *,
+        input_image: Image.Image,
+        input_tensor: object,
+        prompt_state: LearnablePrompt,
+        seed: int,
+        require_grad: bool,
+    ) -> GenerationResult:
+        del input_image, input_tensor, prompt_state, seed, require_grad
+        raise AssertionError("single-image generate should not be used for batch attacks")
+
+    def generate_batch(
+        self,
+        *,
+        input_images: Sequence[Image.Image],
+        input_tensor: object,
+        prompt_state: LearnablePromptBatch,
+        seeds: Sequence[int],
+        require_grad: bool,
+    ) -> GenerationBatchResult:
+        self.batch_calls += 1
+        return super().generate_batch(
+            input_images=input_images,
+            input_tensor=input_tensor,
+            prompt_state=prompt_state,
+            seeds=seeds,
+            require_grad=require_grad,
+        )
+
+
+class TinyVictim:
+    categories = [f"class_{index}" for index in range(1000)]
+
+    def logits_from_tensor(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        means = image_tensor.mean(dim=(1, 2, 3))
+        logits = torch.zeros((image_tensor.shape[0], 1000), device=image_tensor.device)
+        logits[:, 0] = means
+        logits[:, 1] = 1.0 - means
+        return logits
+
+    def evaluate_logits(self, logits: torch.Tensor, true_label: int) -> ClassificationResult:
+        probs = torch.softmax(logits, dim=-1)
+        pred = int(logits.argmax(dim=-1).item())
+        mask = torch.ones_like(logits, dtype=torch.bool)
+        mask[0, true_label] = False
+        other_max = logits.masked_select(mask).view(1, -1).max(dim=-1).values[0]
+        return ClassificationResult(
+            pred=pred,
+            pred_conf=float(probs[0, pred].detach().cpu().item()),
+            true_conf=float(probs[0, true_label].detach().cpu().item()),
+            margin=float((logits[0, true_label] - other_max).detach().cpu().item()),
+        )
+
+    def evaluate_logits_batch(self, logits: torch.Tensor, true_labels: list[int]) -> list[ClassificationResult]:
+        return [
+            self.evaluate_logits(logits[index : index + 1], true_label)
+            for index, true_label in enumerate(true_labels)
+        ]
+
+
+class TinySemantic:
+    def similarity(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        del right
+        return torch.ones(left.shape[0], device=left.device)
+
+
+class EmptyQuality:
+    def score_tensor(self, image_tensor: torch.Tensor) -> dict[str, float]:
+        del image_tensor
+        return {}
+
+
+def test_attack_batch_uses_generator_batch_forward(tmp_path: Path) -> None:
+    image_paths = []
+    for index in range(2):
+        path = tmp_path / f"image_{index}.png"
+        Image.new("RGB", (16, 16), color=(128 + index, 128, 128)).save(path)
+        image_paths.append(path)
+    records = [
+        ImageRecord(
+            path=image_paths[0],
+            synset="class_0000",
+            class_label="class zero",
+            class_index=0,
+            image_id="image_0",
+        ),
+        ImageRecord(
+            path=image_paths[1],
+            synset="class_0001",
+            class_label="class one",
+            class_index=1,
+            image_id="image_1",
+        ),
+    ]
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        generator=replace(config.generator, name="mock", model_id="mock", batch_size=2),
+        attack=replace(config.attack, steps=1, num_learnable_tokens=4),
+        output=replace(config.output, root=tmp_path / "outputs"),
+        quality=replace(config.quality, nriqa=replace(config.quality.nriqa, enabled=False)),
+    )
+    generator = CountingBatchGenerator(device="cpu")
+    components = AttackComponents(
+        victim=TinyVictim(),
+        semantic=TinySemantic(),
+        generator=generator,
+        quality_evaluator=EmptyQuality(),
+    )
+
+    rows = LearnableTokenAttackRunner(config, device="cpu").attack_batch(records, components)
+
+    assert generator.batch_calls == 1
+    assert len(rows) == 2
+    assert all(row["generator_batch_size"] == 2 for row in rows)
+
+
+def test_universal_prompt_trains_shared_embedding_and_evaluates(tmp_path: Path) -> None:
+    image_paths = []
+    for index in range(2):
+        path = tmp_path / f"uap_image_{index}.png"
+        Image.new("RGB", (16, 16), color=(128 + index, 128, 128)).save(path)
+        image_paths.append(path)
+    records = [
+        ImageRecord(
+            path=image_paths[0],
+            synset="class_0000",
+            class_label="class zero",
+            class_index=0,
+            image_id="uap_image_0",
+        ),
+        ImageRecord(
+            path=image_paths[1],
+            synset="class_0001",
+            class_label="class one",
+            class_index=1,
+            image_id="uap_image_1",
+        ),
+    ]
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        generator=replace(config.generator, name="mock", model_id="mock", batch_size=1),
+        attack=replace(
+            config.attack,
+            training_mode="universal",
+            batch_size=2,
+            steps=2,
+            num_learnable_tokens=4,
+        ),
+        output=replace(config.output, root=tmp_path / "outputs"),
+        quality=replace(config.quality, nriqa=replace(config.quality.nriqa, enabled=False)),
+    )
+    components = AttackComponents(
+        victim=TinyVictim(),
+        semantic=TinySemantic(),
+        generator=MockEditableGenerator(device="cpu"),
+        quality_evaluator=EmptyQuality(),
+    )
+    runner = LearnableTokenAttackRunner(config, device="cpu")
+
+    prompt_state, history = runner.train_universal_prompt(
+        records,
+        components,
+        history_path=tmp_path / "history.csv",
+    )
+    rows = runner.evaluate_universal_prompt(
+        records,
+        components,
+        prompt_state,
+        stage="test",
+        metrics_path=tmp_path / "results.csv",
+    )
+
+    assert len(history) == 2
+    assert isinstance(prompt_state.learnable_embeddings, torch.Tensor)
+    assert prompt_state.learnable_embeddings.ndim == 2
+    assert len(rows) == 2
+    assert all(row["clean_correct"] in {True, False} for row in rows)
+    assert all(row["training_mode"] == "universal" for row in rows)
+    assert all(row["stage"] == "test" for row in rows)
+    assert all(row["world_size"] == 1 for row in history)

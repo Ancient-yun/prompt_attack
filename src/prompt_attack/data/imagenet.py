@@ -73,6 +73,13 @@ def list_class_images(class_dir: Path) -> list[Path]:
     return sorted(images)
 
 
+def candidate_limit(config: DataConfig) -> int | None:
+    """Return the per-class candidate cap, or ``None`` when all images are requested."""
+    if config.images_per_class is None:
+        return None
+    return config.images_per_class * max(config.candidate_multiplier, 1)
+
+
 @lru_cache(maxsize=1)
 def imagenet_categories() -> tuple[str, ...]:
     """Return torchvision's ImageNet-1K category names."""
@@ -86,14 +93,16 @@ def build_fixed_10_records(config: DataConfig) -> list[ImageRecord]:
     root = split_dir(config)
     indices = class_index_map(root)
     records: list[ImageRecord] = []
-    max_candidates = config.images_per_class * max(config.candidate_multiplier, 1)
+    max_candidates = candidate_limit(config)
 
     for cls in selected_classes(config):
         class_dir = root / cls.synset
         if not class_dir.exists():
             raise FileNotFoundError(f"Configured synset not found: {class_dir}")
         class_idx = indices[cls.synset]
-        for image_path in list_class_images(class_dir)[:max_candidates]:
+        image_paths = list_class_images(class_dir)
+        selected_paths = image_paths if max_candidates is None else image_paths[:max_candidates]
+        for image_path in selected_paths:
             records.append(
                 ImageRecord(
                     path=image_path,
@@ -146,11 +155,13 @@ def build_imagenet_folder_records(config: DataConfig) -> list[ImageRecord]:
     indices = class_index_map(root)
     categories = imagenet_categories()
     records: list[ImageRecord] = []
-    max_candidates = config.images_per_class * max(config.candidate_multiplier, 1)
+    max_candidates = candidate_limit(config)
 
     for synset, class_idx in sorted(indices.items(), key=lambda item: item[1]):
         class_dir = root / synset
-        for image_path in list_class_images(class_dir)[:max_candidates]:
+        image_paths = list_class_images(class_dir)
+        selected_paths = image_paths if max_candidates is None else image_paths[:max_candidates]
+        for image_path in selected_paths:
             records.append(
                 ImageRecord(
                     path=image_path,

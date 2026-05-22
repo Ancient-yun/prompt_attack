@@ -88,6 +88,29 @@ class WandbLogger:
         self._run.define_metric(f"image_train/{image_key}/*", step_metric=step_metric)
         self._defined_image_metrics.add(image_key)
 
+    def log_universal_step(
+        self,
+        *,
+        attack_step: int,
+        values: dict[str, float | int | bool],
+    ) -> None:
+        """Log one shared-prompt optimization step."""
+        if self._run is None:
+            self._global_step += 1
+            return
+        if attack_step % self.config.logging.wandb.log_every_steps != 0:
+            self._global_step += 1
+            return
+        self._run.define_metric("uap_train/step")
+        self._run.define_metric("uap_train/*", step_metric="uap_train/step")
+        payload: dict[str, Any] = {
+            "progress/global_step": self._global_step,
+            "uap_train/step": attack_step,
+        }
+        payload.update({f"uap_train/{key}": value for key, value in values.items()})
+        self._run.log(payload, step=self._global_step)
+        self._global_step += 1
+
     def log_step(
         self,
         *,

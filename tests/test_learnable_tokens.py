@@ -8,6 +8,7 @@ from prompt_attack.attacks.learnable_tokens import (
     validate_token_init_std,
 )
 from prompt_attack.config import GeneratorConfig
+from prompt_attack.generators.base import LearnablePromptBatch
 from prompt_attack.generators.flux2 import Flux2Adapter
 from prompt_attack.generators.mock import MockEditableGenerator
 
@@ -51,6 +52,83 @@ def test_mock_generator_learnable_embeddings_receive_grad_and_update() -> None:
     )
     image_tensor = generated.image_tensor
     assert isinstance(image_tensor, torch.Tensor)
+    image_tensor.sum().backward()
+    optimizer.step()
+
+    assert learnable_embeddings.grad is not None
+    assert not torch.allclose(learnable_embeddings.detach(), before)
+
+
+def test_mock_generator_batch_learnable_embeddings_receive_grad_and_update() -> None:
+    generator = MockEditableGenerator(device="cpu")
+    prompt_state = generator.create_learnable_prompt_batch(
+        class_labels=["dummy one", "dummy two"],
+        num_tokens=4,
+        initializer="object",
+        init_std=0.1,
+    )
+    learnable_embeddings = prompt_state.learnable_embeddings
+    assert isinstance(learnable_embeddings, torch.Tensor)
+    assert learnable_embeddings.shape[0] == 2
+    input_tensor = torch.full((2, 3, 8, 8), 0.5)
+    images = [
+        Image.new("RGB", (8, 8), color=(128, 128, 128)),
+        Image.new("RGB", (8, 8), color=(128, 128, 128)),
+    ]
+    before = learnable_embeddings.detach().clone()
+    optimizer = torch.optim.Adam([learnable_embeddings], lr=0.1)
+
+    generated = generator.generate_batch(
+        input_images=images,
+        input_tensor=input_tensor,
+        prompt_state=prompt_state,
+        seeds=[0, 1],
+        require_grad=True,
+    )
+    image_tensor = generated.image_tensor
+    assert isinstance(image_tensor, torch.Tensor)
+    assert image_tensor.shape == input_tensor.shape
+    image_tensor.sum().backward()
+    optimizer.step()
+
+    assert learnable_embeddings.grad is not None
+    assert not torch.allclose(learnable_embeddings.detach(), before)
+
+
+def test_mock_generator_shared_batch_embeddings_receive_grad_and_update() -> None:
+    generator = MockEditableGenerator(device="cpu")
+    prompt_state = generator.create_learnable_prompt(
+        class_label="dummy",
+        num_tokens=4,
+        initializer="object",
+        init_std=0.1,
+    )
+    learnable_embeddings = prompt_state.learnable_embeddings
+    assert isinstance(learnable_embeddings, torch.Tensor)
+    input_tensor = torch.full((2, 3, 8, 8), 0.5)
+    images = [
+        Image.new("RGB", (8, 8), color=(128, 128, 128)),
+        Image.new("RGB", (8, 8), color=(128, 128, 128)),
+    ]
+    before = learnable_embeddings.detach().clone()
+    optimizer = torch.optim.Adam([learnable_embeddings], lr=0.1)
+    batch_state = LearnablePromptBatch(
+        prompt_texts=(prompt_state.prompt_text, prompt_state.prompt_text),
+        token_texts=prompt_state.token_texts,
+        token_ids=prompt_state.token_ids,
+        learnable_embeddings=prompt_state.learnable_embeddings,
+    )
+
+    generated = generator.generate_batch(
+        input_images=images,
+        input_tensor=input_tensor,
+        prompt_state=batch_state,
+        seeds=[0, 1],
+        require_grad=True,
+    )
+    image_tensor = generated.image_tensor
+    assert isinstance(image_tensor, torch.Tensor)
+    assert image_tensor.shape == input_tensor.shape
     image_tensor.sum().backward()
     optimizer.step()
 
@@ -162,3 +240,65 @@ def test_flux2_embedding_hook_routes_gradient_to_learnable_tokens() -> None:
     assert learnable_embeddings.grad is not None
     assert learnable_embeddings.grad.abs().sum() > 0
 
+
+def test_flux2_batch_embedding_hook_routes_per_row_gradient_to_learnable_tokens() -> None:
+    pipe = FakePipe()
+    adapter = Flux2Adapter(
+        GeneratorConfig(name="flux2_klein_4b", model_id="fake"),
+        device="cpu",
+    )
+    adapter._pipe = pipe
+    prompt_state = adapter.create_learnable_prompt_batch(
+        class_labels=["dummy one", "dummy two"],
+        num_tokens=1,
+        initializer="object",
+        init_std=0.01,
+    )
+    learnable_embeddings = prompt_state.learnable_embeddings
+    assert isinstance(learnable_embeddings, torch.Tensor)
+
+    embedding_layer = pipe.text_encoder.get_input_embeddings()
+    input_ids = torch.tensor(
+        [
+            [prompt_state.token_ids[0], 0],
+            [0, prompt_state.token_ids[0]],
+        ]
+    )
+    handle = adapter._register_learnable_embedding_hook(prompt_state)
+    try:
+        embedding_layer(input_ids).sum().backward()
+    finally:
+        handle.remove()
+
+    assert learnable_embeddings.grad is not None
+    assert learnable_embeddings.grad.shape == learnable_embeddings.shape
+    assert torch.all(learnable_embeddings.grad.abs().sum(dim=(1, 2)) > 0)
+
+
+class FakeLatentPipe:
+    def _encode_vae_image(self, image: torch.Tensor, generator: object) -> torch.Tensor:
+        del generator
+        return image
+
+    def _pack_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        batch, channels, height, width = latents.shape
+        return latents.reshape(batch, channels, height * width).permute(0, 2, 1)
+
+
+def test_flux2_per_sample_image_latents_do_not_share_references() -> None:
+    first = torch.zeros((1, 3, 4, 4))
+    second = torch.ones((1, 3, 4, 4))
+
+    latents, latent_ids = Flux2Adapter._prepare_per_sample_image_latents(
+        FakeLatentPipe(),
+        [first, second],
+        batch_size=2,
+        generator=None,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert latents.shape == (2, 16, 3)
+    assert latent_ids.shape == (2, 16, 4)
+    assert torch.all(latents[0] == 0)
+    assert torch.all(latents[1] == 1)

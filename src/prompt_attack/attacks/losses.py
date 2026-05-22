@@ -2,30 +2,52 @@
 
 from __future__ import annotations
 
+from typing import Any
 
-def untargeted_margin_loss(logits, true_label: int):
+
+def _target_tensor(logits, true_label: Any):
+    import torch
+
+    if torch.is_tensor(true_label):
+        target = true_label.to(device=logits.device, dtype=torch.long)
+    else:
+        target = torch.tensor([true_label], device=logits.device, dtype=torch.long)
+    if target.ndim == 0:
+        target = target.unsqueeze(0)
+    return target
+
+
+def _reduce_loss(loss, reduction: str):
+    if reduction == "none":
+        return loss
+    if reduction == "mean":
+        return loss.mean()
+    raise ValueError(f"Unsupported loss reduction: {reduction}")
+
+
+def untargeted_margin_loss(logits, true_label: Any, *, reduction: str = "mean"):
     """Return logit_true - max(logit_other) for minimization."""
     import torch
 
-    true_logit = logits[0, true_label]
-    mask = torch.ones_like(logits, dtype=torch.bool)
-    mask[0, true_label] = False
-    other_max = logits.masked_select(mask).view(1, -1).max(dim=-1).values[0]
-    return true_logit - other_max
+    target = _target_tensor(logits, true_label)
+    true_logit = logits.gather(1, target.view(-1, 1)).squeeze(1)
+    other_logits = logits.clone()
+    other_logits.scatter_(1, target.view(-1, 1), -torch.inf)
+    other_max = other_logits.max(dim=-1).values
+    return _reduce_loss(true_logit - other_max, reduction)
 
 
-def negative_cross_entropy_loss(logits, true_label: int):
+def negative_cross_entropy_loss(logits, true_label: Any, *, reduction: str = "mean"):
     """Return -CE(logits, true_label) so minimization maximizes true-label CE."""
-    import torch
     import torch.nn.functional as F
 
-    target = torch.tensor([true_label], device=logits.device, dtype=torch.long)
-    return -F.cross_entropy(logits, target)
+    target = _target_tensor(logits, true_label)
+    return -F.cross_entropy(logits, target, reduction=reduction)
 
 
-def cr_loss(logits, true_label: int):
+def cr_loss(logits, true_label: Any, *, reduction: str = "mean"):
     """Return the classification-rejection loss."""
-    return negative_cross_entropy_loss(logits, true_label)
+    return negative_cross_entropy_loss(logits, true_label, reduction=reduction)
 
 
 def _normalized_objective(objective: str) -> str:
@@ -49,20 +71,20 @@ def is_cr_dino_objective(objective: str) -> bool:
     }
 
 
-def attack_loss_from_objective(logits, true_label: int, objective: str):
+def attack_loss_from_objective(logits, true_label: Any, objective: str, *, reduction: str = "mean"):
     """Dispatch the configured untargeted attack objective."""
     normalized = _normalized_objective(objective)
     if normalized == "untargeted_margin":
-        return untargeted_margin_loss(logits, true_label)
+        return untargeted_margin_loss(logits, true_label, reduction=reduction)
     if is_cr_objective(objective) or is_cr_dino_objective(objective):
-        return cr_loss(logits, true_label)
+        return cr_loss(logits, true_label, reduction=reduction)
     if normalized in {
         "negative_cross_entropy",
         "neg_cross_entropy",
         "negce",
         "untargeted_negative_cross_entropy",
     }:
-        return negative_cross_entropy_loss(logits, true_label)
+        return negative_cross_entropy_loss(logits, true_label, reduction=reduction)
     raise ValueError(f"Unsupported attack objective: {objective}")
 
 

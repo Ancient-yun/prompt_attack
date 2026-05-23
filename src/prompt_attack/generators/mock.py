@@ -140,7 +140,10 @@ class MockEditableGenerator:
         image_tensor = (input_tensor + color_shift).clamp(0, 1)
         if not require_grad:
             image_tensor = image_tensor.detach()
+        pil_images = []
+        if not require_grad:
+            pil_images = [tensor_to_pil(image_tensor[index]) for index in range(image_tensor.shape[0])]
         return GenerationBatchResult(
             image_tensor=image_tensor,
-            pil_images=[tensor_to_pil(image_tensor[index]) for index in range(image_tensor.shape[0])],
+            pil_images=pil_images,
         )

@@ -415,7 +415,7 @@ class Flux2Adapter:
             image_tensor = image_tensor.to(dtype=torch.float32).clamp(0, 1)
             return GenerationBatchResult(
                 image_tensor=image_tensor,
-                pil_images=[tensor_to_pil(image_tensor[index]) for index in range(image_tensor.shape[0])],
+                pil_images=[],
             )
 
         hook = self._register_learnable_embedding_hook(prompt_state)

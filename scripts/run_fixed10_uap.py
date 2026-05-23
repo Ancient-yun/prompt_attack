@@ -113,10 +113,13 @@ def terminal_stage(index: int, total: int, title: str) -> None:
 def run_name(args: argparse.Namespace, *, train_ipc: int | None, test_ipc: int | None) -> str:
     train_label = images_per_class_label(train_ipc)
     test_label = images_per_class_label(test_ipc)
+    objective_label = args.objective.lower().replace("-", "_")
+    lambda_label = f"{args.lambda_sem:g}".replace(".", "p")
     return (
         f"uap_fixed10_train{train_label}_test{test_label}_"
         f"gb{global_batch_size(args)}_gbs{args.generator_batch_size}_"
-        f"epochs{args.epochs}_nis{args.num_inference_steps}_tokens{args.num_tokens}"
+        f"epochs{args.epochs}_nis{args.num_inference_steps}_tokens{args.num_tokens}_"
+        f"{objective_label}_lam{lambda_label}"
     )
 
 

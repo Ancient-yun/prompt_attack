@@ -31,19 +31,19 @@ class MockEditableGenerator:
         num_tokens: int,
         initializer: str,
         init_std: float,
+        init_seed: int = 0,
     ) -> LearnablePrompt:
         """Create mock learnable token embeddings for smoke tests."""
         import torch
 
-        del initializer
         validate_token_init_std(init_std)
         token_texts = build_token_texts(num_tokens)
-        values = torch.randn(
-            num_tokens,
-            self.embedding_dim,
-            device=self.device,
-            dtype=torch.float32,
-        ) * init_std
+        values = self._initial_values(
+            initializer=initializer,
+            shape=(num_tokens, self.embedding_dim),
+            init_std=init_std,
+            init_seed=init_seed,
+        )
         return LearnablePrompt(
             prompt_text=build_prompt(class_label, num_tokens),
             token_texts=token_texts,
@@ -58,26 +58,51 @@ class MockEditableGenerator:
         num_tokens: int,
         initializer: str,
         init_std: float,
+        init_seed: int = 0,
     ) -> LearnablePromptBatch:
         """Create per-sample mock learnable token embeddings for batch smoke tests."""
         import torch
 
-        del initializer
         validate_token_init_std(init_std)
         token_texts = build_token_texts(num_tokens)
-        values = torch.randn(
-            len(class_labels),
-            num_tokens,
-            self.embedding_dim,
-            device=self.device,
-            dtype=torch.float32,
-        ) * init_std
+        values = self._initial_values(
+            initializer=initializer,
+            shape=(len(class_labels), num_tokens, self.embedding_dim),
+            init_std=init_std,
+            init_seed=init_seed,
+        )
         return LearnablePromptBatch(
             prompt_texts=tuple(build_prompt(label, num_tokens) for label in class_labels),
             token_texts=token_texts,
             token_ids=tuple(range(num_tokens)),
             learnable_embeddings=torch.nn.Parameter(values),
         )
+
+    def _initial_values(
+        self,
+        *,
+        initializer: str,
+        shape: tuple[int, ...],
+        init_std: float,
+        init_seed: int,
+    ):
+        """Create deterministic mock initial embeddings for supported initializer names."""
+        import torch
+
+        normalized = initializer.lower().replace("-", "_")
+        generator = torch.Generator(device=self.device).manual_seed(init_seed)
+        noise = torch.randn(shape, generator=generator, device=self.device, dtype=torch.float32)
+        if normalized == "random_real_tokens":
+            base = torch.empty(shape, device=self.device, dtype=torch.float32).uniform_(
+                -0.05,
+                0.05,
+                generator=generator,
+            )
+        elif normalized == "fixed10_class_average":
+            base = torch.full(shape, 0.01, device=self.device, dtype=torch.float32)
+        else:
+            base = torch.zeros(shape, device=self.device, dtype=torch.float32)
+        return base + noise * init_std
 
     def sync_learnable_prompt(self, prompt_state: LearnablePrompt) -> None:
         """Mock generator has no embedding table to synchronize."""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from collections.abc import Sequence
 from types import MethodType
 
@@ -19,6 +20,7 @@ from prompt_attack.generators.base import (
     LearnablePrompt,
     LearnablePromptBatch,
 )
+from prompt_attack.data.imagenet import FIXED_10_CLASSES
 from prompt_attack.utils.image import pil_to_tensor, tensor_to_pil
 
 
@@ -119,6 +121,81 @@ class Flux2Adapter:
         with torch.no_grad():
             return weight.index_select(0, ids).float().mean(dim=0)
 
+    def _fixed10_class_average_embedding(self):
+        """Return the mean embedding across configured fixed-10 class labels."""
+        import torch
+
+        embeddings = [self._initializer_embedding(cls.label) for cls in FIXED_10_CLASSES]
+        return torch.stack(embeddings, dim=0).mean(dim=0)
+
+    def _random_real_token_embeddings(
+        self,
+        *,
+        num_tokens: int,
+        exclude_token_ids: tuple[int, ...],
+        init_seed: int,
+    ):
+        """Return deterministic random existing-token embedding rows."""
+        import torch
+
+        pipe = self._load_pipe()
+        tokenizer = pipe.tokenizer
+        embedding_layer = pipe.text_encoder.get_input_embeddings()
+        weight = embedding_layer.weight
+        special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+        for token in getattr(tokenizer, "all_special_tokens", []) or []:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            if token_id is not None:
+                special_ids.add(int(token_id))
+        excluded = special_ids | set(exclude_token_ids)
+        upper = min(len(tokenizer), weight.shape[0])
+        candidates = [token_id for token_id in range(upper) if token_id not in excluded]
+        if not candidates:
+            raise ValueError("No tokenizer rows are available for random_real_tokens initialization.")
+        rng = random.Random(init_seed)
+        if len(candidates) >= num_tokens:
+            sampled = rng.sample(candidates, num_tokens)
+        else:
+            sampled = [rng.choice(candidates) for _ in range(num_tokens)]
+        ids = torch.tensor(sampled, device=weight.device, dtype=torch.long)
+        with torch.no_grad():
+            return weight.index_select(0, ids).float()
+
+    def _initial_values(
+        self,
+        *,
+        initializer: str,
+        num_tokens: int,
+        token_ids: tuple[int, ...],
+        init_std: float,
+        init_seed: int,
+    ):
+        """Create learnable-token initial values for one prompt state."""
+        import torch
+
+        normalized = initializer.lower().replace("-", "_")
+        if normalized == "random_real_tokens":
+            values = self._random_real_token_embeddings(
+                num_tokens=num_tokens,
+                exclude_token_ids=token_ids,
+                init_seed=init_seed,
+            )
+        else:
+            if normalized == "fixed10_class_average":
+                initializer_embedding = self._fixed10_class_average_embedding()
+            else:
+                initializer_embedding = self._initializer_embedding(initializer)
+            values = initializer_embedding.repeat(num_tokens, 1)
+        values = values.to(device=torch.device(self.device), dtype=torch.float32)
+        generator = torch.Generator(device=values.device).manual_seed(init_seed)
+        noise = torch.randn(
+            values.shape,
+            generator=generator,
+            device=values.device,
+            dtype=values.dtype,
+        )
+        return values + noise * init_std
+
     def create_learnable_prompt(
         self,
         *,
@@ -126,6 +203,7 @@ class Flux2Adapter:
         num_tokens: int,
         initializer: str,
         init_std: float,
+        init_seed: int = 0,
     ) -> LearnablePrompt:
         """Create textual-inversion tokens initialized from an existing token."""
         import torch
@@ -133,12 +211,13 @@ class Flux2Adapter:
         validate_token_init_std(init_std)
         token_texts = build_token_texts(num_tokens)
         token_ids = self._ensure_learnable_tokens(token_texts)
-        initializer_embedding = self._initializer_embedding(initializer)
-        values = initializer_embedding.to(device=torch.device(self.device), dtype=torch.float32).repeat(
-            num_tokens,
-            1,
+        values = self._initial_values(
+            initializer=initializer,
+            num_tokens=num_tokens,
+            token_ids=token_ids,
+            init_std=init_std,
+            init_seed=init_seed,
         )
-        values = values + torch.randn_like(values) * init_std
         prompt_state = LearnablePrompt(
             prompt_text=build_prompt(class_label, num_tokens),
             token_texts=token_texts,
@@ -155,6 +234,7 @@ class Flux2Adapter:
         num_tokens: int,
         initializer: str,
         init_std: float,
+        init_seed: int = 0,
     ) -> LearnablePromptBatch:
         """Create per-sample textual-inversion tokens for a batch."""
         import torch
@@ -164,12 +244,19 @@ class Flux2Adapter:
         validate_token_init_std(init_std)
         token_texts = build_token_texts(num_tokens)
         token_ids = self._ensure_learnable_tokens(token_texts)
-        initializer_embedding = self._initializer_embedding(initializer)
-        base_values = initializer_embedding.to(
-            device=torch.device(self.device),
-            dtype=torch.float32,
-        ).repeat(len(class_labels), num_tokens, 1)
-        values = base_values + torch.randn_like(base_values) * init_std
+        values = torch.stack(
+            [
+                self._initial_values(
+                    initializer=initializer,
+                    num_tokens=num_tokens,
+                    token_ids=token_ids,
+                    init_std=init_std,
+                    init_seed=init_seed + index,
+                )
+                for index in range(len(class_labels))
+            ],
+            dim=0,
+        )
         prompt_state = LearnablePromptBatch(
             prompt_texts=tuple(build_prompt(label, num_tokens) for label in class_labels),
             token_texts=token_texts,

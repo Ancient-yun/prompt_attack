@@ -32,6 +32,7 @@ attack:
   num_learnable_tokens: 16
   learnable_token_initializer: object
   learnable_token_init_std: 0.02
+  learnable_token_init_seed: 0
   lr: 1.0e-2
   lr_scheduler:
     name: cosine
@@ -40,6 +41,8 @@ attack:
   steps: 100
   lambda_sem: 0.0
   semantic_threshold: 0.85
+  semantic_penalty_weight: 10.0
+  attack_margin: 0.0
   objective: cr
 
 output:

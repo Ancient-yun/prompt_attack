@@ -173,6 +173,34 @@ def test_clean_correct_filter_allows_uncapped_per_class_selection() -> None:
     assert selected == records
 
 
+def test_universal_train_batches_shuffle_deterministically_each_epoch() -> None:
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    runner = LearnableTokenAttackRunner(config, device="cpu")
+    records = [
+        ImageRecord(
+            path=Path(f"image_{index}.png"),
+            synset=f"class_{index:04d}",
+            class_label=f"class {index}",
+            class_index=index,
+            image_id=f"image_{index}",
+        )
+        for index in range(8)
+    ]
+
+    epoch0 = runner._shuffled_record_batches(records, batch_size=2, epoch=0)
+    epoch0_repeat = runner._shuffled_record_batches(records, batch_size=2, epoch=0)
+    epoch1 = runner._shuffled_record_batches(records, batch_size=2, epoch=1)
+    epoch0_ids = [record.image_id for batch in epoch0 for record in batch]
+    epoch1_ids = [record.image_id for batch in epoch1 for record in batch]
+    original_ids = [record.image_id for record in records]
+
+    assert epoch0 == epoch0_repeat
+    assert epoch0_ids != original_ids
+    assert epoch1_ids != epoch0_ids
+    assert sorted(epoch0_ids) == sorted(original_ids)
+    assert sorted(epoch1_ids) == sorted(original_ids)
+
+
 class CountingBatchGenerator(MockEditableGenerator):
     def __init__(self, *, device: str) -> None:
         super().__init__(device=device)

@@ -52,7 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-tokens", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1.0)
     parser.add_argument("--lambda-sem", type=float, default=0.0)
+    parser.add_argument("--attack-margin", type=float, default=0.0)
+    parser.add_argument("--semantic-penalty-weight", type=float, default=10.0)
     parser.add_argument("--objective", default="cr")
+    parser.add_argument("--learnable-token-initializer", default="object")
+    parser.add_argument("--learnable-token-init-seed", type=int, default=0)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--generator", default="flux2", choices=("flux2", "mock"))
@@ -115,11 +119,12 @@ def run_name(args: argparse.Namespace, *, train_ipc: int | None, test_ipc: int |
     test_label = images_per_class_label(test_ipc)
     objective_label = args.objective.lower().replace("-", "_")
     lambda_label = f"{args.lambda_sem:g}".replace(".", "p")
+    initializer_label = args.learnable_token_initializer.lower().replace("-", "_").replace(" ", "_")
     return (
         f"uap_fixed10_train{train_label}_test{test_label}_"
         f"gb{global_batch_size(args)}_gbs{args.generator_batch_size}_"
         f"epochs{args.epochs}_nis{args.num_inference_steps}_tokens{args.num_tokens}_"
-        f"{objective_label}_lam{lambda_label}"
+        f"{objective_label}_init{initializer_label}_lam{lambda_label}"
     )
 
 
@@ -177,9 +182,13 @@ def build_stage_config(
             training_mode="universal",
             batch_size=global_batch_size(args),
             num_learnable_tokens=args.num_tokens,
+            learnable_token_initializer=args.learnable_token_initializer,
+            learnable_token_init_seed=args.learnable_token_init_seed,
             lr=args.lr,
             steps=steps,
             lambda_sem=args.lambda_sem,
+            semantic_penalty_weight=args.semantic_penalty_weight,
+            attack_margin=args.attack_margin,
             objective=args.objective,
         ),
         output=OutputConfig(root=output_root, save_grids=True, save_images=True),
@@ -248,6 +257,11 @@ def print_run_overview(
         ("train records", train_records),
         ("test records", test_records),
         ("clean-correct only", not args.include_clean_incorrect),
+        ("objective", args.objective),
+        ("initializer", args.learnable_token_initializer),
+        ("init seed", args.learnable_token_init_seed),
+        ("attack margin", args.attack_margin),
+        ("semantic penalty weight", args.semantic_penalty_weight),
         ("train updates", steps),
         ("global batch", global_batch_size(args)),
         ("generator batch", args.generator_batch_size),
@@ -487,6 +501,11 @@ def main() -> None:
                 "epochs": args.epochs,
                 "global_batch_size": global_batch_size(args),
                 "generator_batch_size": args.generator_batch_size,
+                "objective": args.objective,
+                "learnable_token_initializer": args.learnable_token_initializer,
+                "learnable_token_init_seed": args.learnable_token_init_seed,
+                "attack_margin": args.attack_margin,
+                "semantic_penalty_weight": args.semantic_penalty_weight,
                 "save_train_images": args.save_train_images,
                 "train": train_summary,
                 "test": test_summary,
@@ -511,6 +530,10 @@ def main() -> None:
                     "num_learnable_tokens": args.num_tokens,
                     "objective": args.objective,
                     "lambda_sem": args.lambda_sem,
+                    "learnable_token_initializer": args.learnable_token_initializer,
+                    "learnable_token_init_seed": args.learnable_token_init_seed,
+                    "attack_margin": args.attack_margin,
+                    "semantic_penalty_weight": args.semantic_penalty_weight,
                     "lr": args.lr,
                     "output_root": str(output_root),
                 },

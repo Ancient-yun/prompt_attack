@@ -62,10 +62,13 @@ class AttackConfig:
     num_learnable_tokens: int = 8
     learnable_token_initializer: str = "object"
     learnable_token_init_std: float = 0.02
+    learnable_token_init_seed: int = 0
     lr: float = 1.0e-2
     steps: int = 100
     lambda_sem: float = 0.5
     semantic_threshold: float = 0.85
+    semantic_penalty_weight: float = 10.0
+    attack_margin: float = 0.0
     objective: str = "untargeted_margin"
     lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
 
@@ -244,10 +247,13 @@ def load_config(path: Path) -> ExperimentConfig:
                 attack_raw.get("learnable_token_initializer", "object")
             ),
             learnable_token_init_std=float(attack_raw.get("learnable_token_init_std", 0.02)),
+            learnable_token_init_seed=int(attack_raw.get("learnable_token_init_seed", 0)),
             lr=float(attack_raw.get("lr", 1.0e-2)),
             steps=int(attack_raw.get("steps", 100)),
             lambda_sem=float(attack_raw.get("lambda_sem", 0.5)),
             semantic_threshold=float(attack_raw.get("semantic_threshold", 0.85)),
+            semantic_penalty_weight=float(attack_raw.get("semantic_penalty_weight", 10.0)),
+            attack_margin=float(attack_raw.get("attack_margin", 0.0)),
             objective=str(attack_raw.get("objective", "untargeted_margin")),
             lr_scheduler=LRSchedulerConfig(
                 name=str(lr_scheduler_raw.get("name", "fixed")),
@@ -330,10 +336,13 @@ def with_smoke_overrides(config: ExperimentConfig, *, use_mock_generator: bool) 
             num_learnable_tokens=config.attack.num_learnable_tokens,
             learnable_token_initializer=config.attack.learnable_token_initializer,
             learnable_token_init_std=config.attack.learnable_token_init_std,
+            learnable_token_init_seed=config.attack.learnable_token_init_seed,
             lr=config.attack.lr,
             steps=2,
             lambda_sem=config.attack.lambda_sem,
             semantic_threshold=config.attack.semantic_threshold,
+            semantic_penalty_weight=config.attack.semantic_penalty_weight,
+            attack_margin=config.attack.attack_margin,
             objective=config.attack.objective,
             lr_scheduler=config.attack.lr_scheduler,
         ),

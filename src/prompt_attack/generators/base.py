@@ -55,6 +55,7 @@ class EditableGenerator(Protocol):
         num_tokens: int,
         initializer: str,
         init_std: float,
+        init_seed: int = 0,
     ) -> LearnablePrompt:
         """Create prompt text and trainable token embeddings for one attack."""
 
@@ -65,6 +66,7 @@ class EditableGenerator(Protocol):
         num_tokens: int,
         initializer: str,
         init_std: float,
+        init_seed: int = 0,
     ) -> LearnablePromptBatch:
         """Create prompt texts and trainable token embeddings for a batch attack."""
 

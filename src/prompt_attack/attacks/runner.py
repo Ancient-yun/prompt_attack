@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass
@@ -16,9 +17,7 @@ from tqdm import tqdm
 from prompt_attack.attacks.learnable_tokens import build_prompt
 from prompt_attack.attacks.losses import (
     attack_semantic_loss_weights,
-    attack_loss_from_objective,
-    dino_loss,
-    weighted_attack_semantic_loss,
+    objective_loss_components,
 )
 from prompt_attack.config import ExperimentConfig
 from prompt_attack.data.imagenet import ImageRecord, build_candidate_records, load_image
@@ -40,6 +39,7 @@ from prompt_attack.utils.wandb_logger import WandbLogger
 
 CLEAN_FILTER_BATCH_SIZE = 512
 CLEAN_FILTER_CACHE_DIR = Path("outputs/cache/clean_correct")
+TRAIN_SHUFFLE_SEED = 0
 
 
 def _format_duration(seconds: float) -> str:
@@ -295,6 +295,18 @@ class LearnableTokenAttackRunner:
         batch_size = max(1, batch_size)
         return [records[index : index + batch_size] for index in range(0, len(records), batch_size)]
 
+    def _shuffled_record_batches(
+        self,
+        records: list[ImageRecord],
+        *,
+        batch_size: int,
+        epoch: int,
+    ) -> list[list[ImageRecord]]:
+        """Split records into deterministic shuffled batches for one train epoch."""
+        shuffled = list(records)
+        random.Random(TRAIN_SHUFFLE_SEED + epoch).shuffle(shuffled)
+        return self._record_batches(shuffled, batch_size=batch_size)
+
     def _shared_prompt_batch(
         self,
         prompt_state: LearnablePrompt,
@@ -389,6 +401,7 @@ class LearnableTokenAttackRunner:
             num_tokens=self.config.attack.num_learnable_tokens,
             initializer=self.config.attack.learnable_token_initializer,
             init_std=self.config.attack.learnable_token_init_std,
+            init_seed=self.config.attack.learnable_token_init_seed,
         )
 
     def train_universal_prompt(
@@ -431,7 +444,9 @@ class LearnableTokenAttackRunner:
         lr_scheduler = self._build_lr_scheduler(optimizer)
         effective_batch_size = max(1, self.config.attack.batch_size)
         micro_batch_size = max(1, self.config.generator.batch_size)
-        batches = self._record_batches(records, batch_size=effective_batch_size)
+        num_batches = len(self._record_batches(records, batch_size=effective_batch_size))
+        current_epoch = -1
+        batches: list[list[ImageRecord]] = []
         history: list[dict[str, Any]] = []
         train_started_at = time.perf_counter()
 
@@ -442,12 +457,22 @@ class LearnableTokenAttackRunner:
             dynamic_ncols=True,
         )
         for step in progress:
-            batch = batches[step % len(batches)]
+            epoch = step // num_batches
+            if epoch != current_epoch:
+                current_epoch = epoch
+                batches = self._shuffled_record_batches(
+                    records,
+                    batch_size=effective_batch_size,
+                    epoch=epoch,
+                )
+            batch_index = step % num_batches
+            batch = batches[batch_index]
             local_batch = dist_context.shard(batch)
             optimizer.zero_grad(set_to_none=True)
             current_lr = float(optimizer.param_groups[0]["lr"])
             step_attack_loss = 0.0
             step_dino_loss = 0.0
+            step_semantic_penalty_loss = 0.0
             step_total_loss = 0.0
             step_success = 0
             processed = 0
@@ -467,19 +492,23 @@ class LearnableTokenAttackRunner:
                 if not isinstance(image_tensor, torch.Tensor):
                     raise TypeError("Generator batch result must expose torch.Tensor image_tensor.")
                 logits = components.victim.logits_from_tensor(image_tensor)
-                attack_losses = attack_loss_from_objective(
-                    logits,
-                    true_labels,
-                    self.config.attack.objective,
-                    reduction="none",
+                dino_sim = (
+                    components.semantic.similarity(original_tensor, image_tensor)
+                    if semantic_loss_weight > 0
+                    else None
                 )
-                if semantic_loss_weight > 0:
-                    dino_sim = components.semantic.similarity(original_tensor, image_tensor)
-                    sem_losses = 1.0 - dino_sim
-                    total_losses = attack_loss_weight * attack_losses + semantic_loss_weight * sem_losses
-                else:
-                    sem_losses = torch.zeros_like(attack_losses)
-                    total_losses = attack_losses
+                attack_losses, dino_losses, semantic_penalty_losses, total_losses = (
+                    objective_loss_components(
+                        logits,
+                        true_labels,
+                        self.config.attack.objective,
+                        dino_similarity=dino_sim,
+                        lambda_sem=self.config.attack.lambda_sem,
+                        semantic_threshold=self.config.attack.semantic_threshold,
+                        semantic_penalty_weight=self.config.attack.semantic_penalty_weight,
+                        attack_margin=self.config.attack.attack_margin,
+                    )
+                )
 
                 total_loss = total_losses.sum() / len(batch)
                 if not torch.isfinite(total_loss):
@@ -490,9 +519,12 @@ class LearnableTokenAttackRunner:
                     eval_results = components.victim.evaluate_logits_batch(
                         logits.detach(),
                         true_labels.detach().cpu().tolist(),
-                    )
+                )
                 step_attack_loss += float(attack_losses.detach().sum().cpu().item())
-                step_dino_loss += float(sem_losses.detach().sum().cpu().item())
+                step_dino_loss += float(dino_losses.detach().sum().cpu().item())
+                step_semantic_penalty_loss += float(
+                    semantic_penalty_losses.detach().sum().cpu().item()
+                )
                 step_total_loss += float(total_losses.detach().sum().cpu().item())
                 step_success += sum(
                     int(result.pred != record.class_index)
@@ -504,12 +536,19 @@ class LearnableTokenAttackRunner:
                 learnable_embeddings.grad = torch.zeros_like(learnable_embeddings)
             dist_context.all_reduce_sum(learnable_embeddings.grad)
             stats = torch.tensor(
-                [step_attack_loss, step_dino_loss, step_total_loss, step_success, processed],
+                [
+                    step_attack_loss,
+                    step_dino_loss,
+                    step_semantic_penalty_loss,
+                    step_total_loss,
+                    step_success,
+                    processed,
+                ],
                 device=learnable_embeddings.device,
                 dtype=torch.float64,
             )
             dist_context.all_reduce_sum(stats)
-            global_processed = max(1.0, float(stats[4].detach().cpu().item()))
+            global_processed = max(1.0, float(stats[5].detach().cpu().item()))
             optimizer.step()
             components.generator.sync_learnable_prompt(prompt_state)
             if lr_scheduler is not None:
@@ -517,12 +556,15 @@ class LearnableTokenAttackRunner:
 
             history_row = {
                 "step": step,
-                "batch_index": step % len(batches),
+                "epoch": epoch,
+                "batch_index": batch_index,
                 "lr": current_lr,
                 "attack_loss": float(stats[0].detach().cpu().item()) / global_processed,
                 "dino_loss": float(stats[1].detach().cpu().item()) / global_processed,
-                "total_loss": float(stats[2].detach().cpu().item()) / global_processed,
-                "success_rate": float(stats[3].detach().cpu().item()) / global_processed,
+                "semantic_penalty_loss": float(stats[2].detach().cpu().item())
+                / global_processed,
+                "total_loss": float(stats[3].detach().cpu().item()) / global_processed,
+                "success_rate": float(stats[4].detach().cpu().item()) / global_processed,
                 "effective_batch_size": len(batch),
                 "micro_batch_size": micro_batch_size,
                 "world_size": dist_context.world_size,
@@ -569,6 +611,7 @@ class LearnableTokenAttackRunner:
                     values={
                         "attack_loss": history_row["attack_loss"],
                         "semantic_loss": history_row["dino_loss"],
+                        "semantic_penalty_loss": history_row["semantic_penalty_loss"],
                         "total_loss": history_row["total_loss"],
                         "lr": current_lr,
                         "success_rate": history_row["success_rate"],
@@ -638,18 +681,18 @@ class LearnableTokenAttackRunner:
                     adv_logits,
                     true_labels.detach().cpu().tolist(),
                 )
-                attack_losses = attack_loss_from_objective(
-                    adv_logits,
-                    true_labels,
-                    self.config.attack.objective,
-                    reduction="none",
-                )
                 dino_sim = components.semantic.similarity(original_tensor, image_tensor)
-                dino_losses = 1.0 - dino_sim
-                total_losses = (
-                    attack_loss_weight * attack_losses + semantic_loss_weight * dino_losses
-                    if semantic_loss_weight > 0
-                    else attack_losses
+                attack_losses, dino_losses, semantic_penalty_losses, total_losses = (
+                    objective_loss_components(
+                        adv_logits,
+                        true_labels,
+                        self.config.attack.objective,
+                        dino_similarity=dino_sim,
+                        lambda_sem=self.config.attack.lambda_sem,
+                        semantic_threshold=self.config.attack.semantic_threshold,
+                        semantic_penalty_weight=self.config.attack.semantic_penalty_weight,
+                        attack_margin=self.config.attack.attack_margin,
+                    )
                 )
 
             runtime_seconds = time.perf_counter() - started_at
@@ -696,6 +739,7 @@ class LearnableTokenAttackRunner:
                     "num_learnable_tokens": self.config.attack.num_learnable_tokens,
                     "learnable_token_initializer": self.config.attack.learnable_token_initializer,
                     "learnable_token_init_std": self.config.attack.learnable_token_init_std,
+                    "learnable_token_init_seed": self.config.attack.learnable_token_init_seed,
                     "learnable_token_texts": " ".join(prompt_state.token_texts),
                     "lr": self.config.attack.lr,
                     "lr_scheduler": self.config.attack.lr_scheduler.name,
@@ -706,6 +750,8 @@ class LearnableTokenAttackRunner:
                     "attack_loss_weight": attack_loss_weight,
                     "semantic_loss_weight": semantic_loss_weight,
                     "semantic_threshold": self.config.attack.semantic_threshold,
+                    "semantic_penalty_weight": self.config.attack.semantic_penalty_weight,
+                    "attack_margin": self.config.attack.attack_margin,
                     "objective": self.config.attack.objective,
                     "attack_batch_size": self.config.attack.batch_size,
                     "generator_height": self.config.generator.height,
@@ -728,6 +774,10 @@ class LearnableTokenAttackRunner:
                     "adv_margin": adv_eval.margin,
                     "margin_drop": clean_eval.margin - adv_eval.margin,
                     "dino_similarity": dino_value,
+                    "dino_loss": float(dino_losses[index].detach().cpu().item()),
+                    "semantic_penalty_loss": float(
+                        semantic_penalty_losses[index].detach().cpu().item()
+                    ),
                     "ssim": ssim,
                     **pixel_metrics,
                     **nriqa_metrics,
@@ -742,6 +792,9 @@ class LearnableTokenAttackRunner:
                     "min_adv_margin_step": final_step,
                     "best_attack_loss": float(attack_losses[index].detach().cpu().item()),
                     "best_dino_loss": float(dino_losses[index].detach().cpu().item()),
+                    "best_semantic_penalty_loss": float(
+                        semantic_penalty_losses[index].detach().cpu().item()
+                    ),
                     "best_total_loss": float(total_losses[index].detach().cpu().item()),
                     "runtime_seconds": runtime_seconds,
                     "output_image_path": str(output_dir / "adv.png"),
@@ -874,6 +927,10 @@ class LearnableTokenAttackRunner:
                     "generator_batch_size": self.config.generator.batch_size,
                     "objective": self.config.attack.objective,
                     "lambda_sem": self.config.attack.lambda_sem,
+                    "learnable_token_initializer": self.config.attack.learnable_token_initializer,
+                    "learnable_token_init_seed": self.config.attack.learnable_token_init_seed,
+                    "semantic_penalty_weight": self.config.attack.semantic_penalty_weight,
+                    "attack_margin": self.config.attack.attack_margin,
                     "lr": self.config.attack.lr,
                 },
             )
@@ -911,6 +968,7 @@ class LearnableTokenAttackRunner:
             num_tokens=self.config.attack.num_learnable_tokens,
             initializer=self.config.attack.learnable_token_initializer,
             init_std=self.config.attack.learnable_token_init_std,
+            init_seed=self.config.attack.learnable_token_init_seed,
         )
         learnable_embeddings = prompt_state.learnable_embeddings
         if not isinstance(learnable_embeddings, torch.Tensor):
@@ -938,23 +996,27 @@ class LearnableTokenAttackRunner:
                 require_grad=True,
             )
             logits = victim.logits_from_tensor(generated.image_tensor)
-            attack_loss = attack_loss_from_objective(
-                logits,
-                record.class_index,
-                self.config.attack.objective,
-            )
             dino_sim = None
-            sem_loss = None
+            dino_loss_value = None
+            semantic_penalty_loss = None
             if semantic_loss_weight > 0:
                 dino_sim = semantic.similarity(original_tensor, generated.image_tensor)
-                sem_loss = dino_loss(dino_sim)
-                total_loss = weighted_attack_semantic_loss(
-                    attack_loss,
-                    sem_loss,
-                    self.config.attack.lambda_sem,
+            attack_losses, dino_losses, semantic_penalty_losses, total_losses = (
+                objective_loss_components(
+                    logits,
+                    record.class_index,
+                    self.config.attack.objective,
+                    dino_similarity=dino_sim,
+                    lambda_sem=self.config.attack.lambda_sem,
+                    semantic_threshold=self.config.attack.semantic_threshold,
+                    semantic_penalty_weight=self.config.attack.semantic_penalty_weight,
+                    attack_margin=self.config.attack.attack_margin,
                 )
-            else:
-                total_loss = attack_loss
+            )
+            attack_loss = attack_losses.mean()
+            dino_loss_value = dino_losses.mean()
+            semantic_penalty_loss = semantic_penalty_losses.mean()
+            total_loss = total_losses.mean()
             if not torch.isfinite(total_loss):
                 raise FloatingPointError(f"Non-finite loss for {record.image_id} at step {step}")
             total_loss.backward()
@@ -965,10 +1027,10 @@ class LearnableTokenAttackRunner:
 
             eval_result = victim.evaluate_logits(logits.detach(), record.class_index)
             success = eval_result.pred != record.class_index
-            if dino_sim is None or sem_loss is None:
+            if dino_sim is None:
                 with torch.no_grad():
                     dino_sim = semantic.similarity(original_tensor, generated.image_tensor.detach())
-                    sem_loss = dino_loss(dino_sim)
+                    dino_loss_value = 1.0 - dino_sim.mean()
             semantic_constrained_success = (
                 success and float(dino_sim.detach().cpu().item()) >= self.config.attack.semantic_threshold
             )
@@ -976,7 +1038,8 @@ class LearnableTokenAttackRunner:
                 "step": step,
                 "image_tensor": generated.image_tensor.detach(),
                 "attack_loss": float(attack_loss.detach().cpu().item()),
-                "dino_loss": float(sem_loss.detach().cpu().item()),
+                "dino_loss": float(dino_loss_value.detach().cpu().item()),
+                "semantic_penalty_loss": float(semantic_penalty_loss.detach().cpu().item()),
                 "total_loss": float(total_loss.detach().cpu().item()),
                 "adv_pred": eval_result.pred,
                 "adv_top1_conf": eval_result.pred_conf,
@@ -1062,6 +1125,7 @@ class LearnableTokenAttackRunner:
             "num_learnable_tokens": self.config.attack.num_learnable_tokens,
             "learnable_token_initializer": self.config.attack.learnable_token_initializer,
             "learnable_token_init_std": self.config.attack.learnable_token_init_std,
+            "learnable_token_init_seed": self.config.attack.learnable_token_init_seed,
             "learnable_token_texts": " ".join(prompt_state.token_texts),
             "lr": self.config.attack.lr,
             "lr_scheduler": self.config.attack.lr_scheduler.name,
@@ -1072,6 +1136,8 @@ class LearnableTokenAttackRunner:
             "attack_loss_weight": attack_loss_weight,
             "semantic_loss_weight": semantic_loss_weight,
             "semantic_threshold": self.config.attack.semantic_threshold,
+            "semantic_penalty_weight": self.config.attack.semantic_penalty_weight,
+            "attack_margin": self.config.attack.attack_margin,
             "objective": self.config.attack.objective,
             "attack_batch_size": self.config.attack.batch_size,
             "generator_height": self.config.generator.height,
@@ -1109,6 +1175,7 @@ class LearnableTokenAttackRunner:
             "min_adv_margin_step": int(best_attack["step"]),
             "best_attack_loss": float(best["attack_loss"]),
             "best_dino_loss": float(best["dino_loss"]),
+            "best_semantic_penalty_loss": float(best["semantic_penalty_loss"]),
             "best_total_loss": float(best["total_loss"]),
             "runtime_seconds": runtime_seconds,
             "output_image_path": str(output_dir / "adv.png"),
@@ -1164,6 +1231,7 @@ class LearnableTokenAttackRunner:
             num_tokens=self.config.attack.num_learnable_tokens,
             initializer=self.config.attack.learnable_token_initializer,
             init_std=self.config.attack.learnable_token_init_std,
+            init_seed=self.config.attack.learnable_token_init_seed,
         )
         learnable_embeddings = prompt_state.learnable_embeddings
         if not isinstance(learnable_embeddings, torch.Tensor):
@@ -1202,21 +1270,21 @@ class LearnableTokenAttackRunner:
                     f"Generator returned batch size {image_tensor.shape[0]} for {len(records)} records."
                 )
             logits = victim.logits_from_tensor(image_tensor)
-            attack_losses = attack_loss_from_objective(
-                logits,
-                true_labels,
-                self.config.attack.objective,
-                reduction="none",
-            )
             dino_sim = None
-            sem_losses = None
             if semantic_loss_weight > 0:
                 dino_sim = semantic.similarity(original_tensor, image_tensor)
-                sem_losses = 1.0 - dino_sim
-                total_losses = (1.0 - self.config.attack.lambda_sem) * attack_losses
-                total_losses = total_losses + self.config.attack.lambda_sem * sem_losses
-            else:
-                total_losses = attack_losses
+            attack_losses, dino_losses, semantic_penalty_losses, total_losses = (
+                objective_loss_components(
+                    logits,
+                    true_labels,
+                    self.config.attack.objective,
+                    dino_similarity=dino_sim,
+                    lambda_sem=self.config.attack.lambda_sem,
+                    semantic_threshold=self.config.attack.semantic_threshold,
+                    semantic_penalty_weight=self.config.attack.semantic_penalty_weight,
+                    attack_margin=self.config.attack.attack_margin,
+                )
+            )
             total_loss = total_losses.mean()
             if not torch.isfinite(total_loss):
                 raise FloatingPointError(f"Non-finite batch loss at step {step}")
@@ -1227,10 +1295,10 @@ class LearnableTokenAttackRunner:
                 lr_scheduler.step()
 
             eval_results = victim.evaluate_logits_batch(logits.detach(), true_labels.detach().cpu().tolist())
-            if dino_sim is None or sem_losses is None:
+            if dino_sim is None:
                 with torch.no_grad():
                     dino_sim = semantic.similarity(original_tensor, image_tensor.detach())
-                    sem_losses = 1.0 - dino_sim
+                    dino_losses = 1.0 - dino_sim
             for index, record in enumerate(records):
                 eval_result = eval_results[index]
                 success = eval_result.pred != record.class_index
@@ -1242,7 +1310,10 @@ class LearnableTokenAttackRunner:
                     "step": step,
                     "image_tensor": image_tensor[index : index + 1].detach(),
                     "attack_loss": float(attack_losses[index].detach().cpu().item()),
-                    "dino_loss": float(sem_losses[index].detach().cpu().item()),
+                    "dino_loss": float(dino_losses[index].detach().cpu().item()),
+                    "semantic_penalty_loss": float(
+                        semantic_penalty_losses[index].detach().cpu().item()
+                    ),
                     "total_loss": float(total_losses[index].detach().cpu().item()),
                     "adv_pred": eval_result.pred,
                     "adv_top1_conf": eval_result.pred_conf,
@@ -1347,6 +1418,7 @@ class LearnableTokenAttackRunner:
                 "num_learnable_tokens": self.config.attack.num_learnable_tokens,
                 "learnable_token_initializer": self.config.attack.learnable_token_initializer,
                 "learnable_token_init_std": self.config.attack.learnable_token_init_std,
+                "learnable_token_init_seed": self.config.attack.learnable_token_init_seed,
                 "learnable_token_texts": " ".join(prompt_state.token_texts),
                 "lr": self.config.attack.lr,
                 "lr_scheduler": self.config.attack.lr_scheduler.name,
@@ -1357,6 +1429,8 @@ class LearnableTokenAttackRunner:
                 "attack_loss_weight": attack_loss_weight,
                 "semantic_loss_weight": semantic_loss_weight,
                 "semantic_threshold": self.config.attack.semantic_threshold,
+                "semantic_penalty_weight": self.config.attack.semantic_penalty_weight,
+                "attack_margin": self.config.attack.attack_margin,
                 "objective": self.config.attack.objective,
                 "attack_batch_size": self.config.attack.batch_size,
                 "generator_height": self.config.generator.height,
@@ -1394,6 +1468,7 @@ class LearnableTokenAttackRunner:
                 "min_adv_margin_step": int(best_attack_row["step"]),
                 "best_attack_loss": float(best_row["attack_loss"]),
                 "best_dino_loss": float(best_row["dino_loss"]),
+                "best_semantic_penalty_loss": float(best_row["semantic_penalty_loss"]),
                 "best_total_loss": float(best_row["total_loss"]),
                 "runtime_seconds": runtime_seconds,
                 "output_image_path": str(output_dir / "adv.png"),

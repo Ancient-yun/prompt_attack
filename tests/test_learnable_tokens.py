@@ -8,7 +8,9 @@ from prompt_attack.attacks.learnable_tokens import (
     validate_token_init_std,
 )
 from prompt_attack.config import GeneratorConfig
+from prompt_attack.data.imagenet import FixedClass
 from prompt_attack.generators.base import LearnablePromptBatch
+from prompt_attack.generators import flux2 as flux2_module
 from prompt_attack.generators.flux2 import Flux2Adapter
 from prompt_attack.generators.mock import MockEditableGenerator
 
@@ -211,6 +213,85 @@ def test_flux2_token_addition_is_idempotent() -> None:
     assert first.token_ids == second.token_ids
     assert len(pipe.tokenizer) == 3
     assert pipe.text_encoder.resize_calls == 1
+
+
+def test_flux2_random_real_token_initializer_is_seeded() -> None:
+    pipe = FakePipe()
+    for token in ("alpha", "beta", "gamma", "delta", "epsilon"):
+        pipe.tokenizer.vocab[token] = len(pipe.tokenizer.vocab)
+    pipe.text_encoder.resize_token_embeddings(len(pipe.tokenizer))
+    adapter = Flux2Adapter(
+        GeneratorConfig(name="flux2_klein_4b", model_id="fake"),
+        device="cpu",
+    )
+    adapter._pipe = pipe
+
+    first = adapter.create_learnable_prompt(
+        class_label="dummy",
+        num_tokens=2,
+        initializer="random_real_tokens",
+        init_std=1e-8,
+        init_seed=123,
+    )
+    second = adapter.create_learnable_prompt(
+        class_label="dummy",
+        num_tokens=2,
+        initializer="random_real_tokens",
+        init_std=1e-8,
+        init_seed=123,
+    )
+    third = adapter.create_learnable_prompt(
+        class_label="dummy",
+        num_tokens=2,
+        initializer="random_real_tokens",
+        init_std=1e-8,
+        init_seed=456,
+    )
+
+    first_embeddings = first.learnable_embeddings
+    second_embeddings = second.learnable_embeddings
+    third_embeddings = third.learnable_embeddings
+    assert isinstance(first_embeddings, torch.Tensor)
+    assert isinstance(second_embeddings, torch.Tensor)
+    assert isinstance(third_embeddings, torch.Tensor)
+    assert torch.allclose(first_embeddings, second_embeddings)
+    assert not torch.allclose(first_embeddings, third_embeddings)
+
+
+def test_flux2_fixed10_class_average_initializer(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipe = FakePipe()
+    for token in ("alpha", "beta"):
+        pipe.tokenizer.vocab[token] = len(pipe.tokenizer.vocab)
+    pipe.text_encoder.resize_token_embeddings(len(pipe.tokenizer))
+    monkeypatch.setattr(
+        flux2_module,
+        "FIXED_10_CLASSES",
+        (
+            FixedClass("n00000001", "alpha"),
+            FixedClass("n00000002", "beta"),
+        ),
+    )
+    adapter = Flux2Adapter(
+        GeneratorConfig(name="flux2_klein_4b", model_id="fake"),
+        device="cpu",
+    )
+    adapter._pipe = pipe
+
+    prompt = adapter.create_learnable_prompt(
+        class_label="dummy",
+        num_tokens=1,
+        initializer="fixed10_class_average",
+        init_std=1e-8,
+        init_seed=0,
+    )
+    embedding = pipe.text_encoder.get_input_embeddings().weight
+    expected = embedding[
+        torch.tensor([pipe.tokenizer.vocab["alpha"], pipe.tokenizer.vocab["beta"]])
+    ].mean(dim=0)
+
+    prompt_embeddings = prompt.learnable_embeddings
+    assert isinstance(prompt_embeddings, torch.Tensor)
+    assert torch.allclose(prompt_embeddings[0], expected, atol=1e-6)
 
 
 def test_flux2_embedding_hook_routes_gradient_to_learnable_tokens() -> None:

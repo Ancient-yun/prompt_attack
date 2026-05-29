@@ -42,8 +42,7 @@ attack:
     min_lr: 1.0e-4
   steps: 100
   lambda_sem: 0.0
-  semantic_threshold: 0.85
-  semantic_penalty_weight: 10.0
+  semantic_loss_weight: 10.0
   attack_margin: 0.0
   objective: cr
 

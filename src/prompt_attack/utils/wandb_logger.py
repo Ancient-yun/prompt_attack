@@ -159,12 +159,11 @@ class WandbLogger:
         if self._run is None:
             return
         image_result_index = len(self._image_result_rows)
+        dino_similarity = self._optional_float(row, "dino_similarity")
+        clip_image_similarity = self._optional_float(row, "clip_image_similarity")
         payload: dict[str, Any] = {
             "image_result/index": image_result_index,
             "image_result/success": int(bool(row["success"])),
-            "image_result/semantic_constrained_success": int(
-                bool(row["semantic_constrained_success"])
-            ),
             "image_result/clean_true_conf": float(row["clean_true_conf"]),
             "image_result/adv_true_conf": float(row["adv_true_conf"]),
             "image_result/confidence_drop": float(row["confidence_drop"]),
@@ -173,7 +172,7 @@ class WandbLogger:
             "image_result/clean_logit_gap_true_vs_other": float(row["clean_margin"]),
             "image_result/adv_logit_gap_true_vs_other": float(row["adv_margin"]),
             "image_result/logit_gap_drop": float(row["margin_drop"]),
-            "image_result/dino_similarity": float(row["dino_similarity"]),
+            "image_result/semantic_similarity": float(row["semantic_similarity"]),
             "image_result/ssim": float(row["ssim"]),
             "image_result/pixel_l1_mean": float(row["pixel_l1_mean"]),
             "image_result/pixel_l2": float(row["pixel_l2"]),
@@ -181,9 +180,7 @@ class WandbLogger:
             "image_result/pixel_linf": float(row["pixel_linf"]),
             "image_result/best_step": int(row["best_step"]),
             "image_result/best_attack_step": int(row["best_attack_step"]),
-            "image_result/best_semantic_success_step": int(row["best_semantic_success_step"]),
             "image_result/first_success_step": int(row["first_success_step"]),
-            "image_result/first_semantic_success_step": int(row["first_semantic_success_step"]),
             "image_result/min_adv_true_conf": float(row["min_adv_true_conf"]),
             "image_result/min_adv_logit_gap_true_vs_other": float(row["min_adv_margin"]),
             "image_result/runtime_seconds": float(row["runtime_seconds"]),
@@ -192,7 +189,13 @@ class WandbLogger:
             "image_result/adv_pred_label": row["adv_pred_label"],
             "image_result/image_id": row["image_id"],
             "image_result/objective": row["objective"],
+            "image_result/semantic_model": row["semantic_model"],
+            "image_result/semantic_metric": row["semantic_metric"],
         }
+        if dino_similarity is not None:
+            payload["image_result/dino_similarity"] = dino_similarity
+        if clip_image_similarity is not None:
+            payload["image_result/clip_image_similarity"] = clip_image_similarity
         for key in ("nima_ava", "hyperiqa", "musiq_ava", "musiq_koniq", "tres"):
             value = self._optional_float(row, f"iqa_{key}")
             if value is not None:
@@ -204,8 +207,7 @@ class WandbLogger:
             )
             adversarial_caption = (
                 f"adv={row['adv_pred_label']} | success={row['success']} | "
-                f"sem_success={row['semantic_constrained_success']} | "
-                f"dino={float(row['dino_similarity']):.3f}"
+                f"{row['semantic_metric']}={float(row['semantic_similarity']):.3f}"
             )
             payload["image_result/original"] = self._wandb.Image(
                 original,
@@ -227,12 +229,13 @@ class WandbLogger:
                 row["clean_pred_label"],
                 row["adv_pred_label"],
                 bool(row["success"]),
-                bool(row["semantic_constrained_success"]),
                 float(row["clean_true_conf"]),
                 float(row["adv_true_conf"]),
                 float(row["confidence_drop"]),
                 float(row["margin_drop"]),
-                float(row["dino_similarity"]),
+                float(row["semantic_similarity"]),
+                dino_similarity,
+                clip_image_similarity,
                 float(row["ssim"]),
                 self._optional_float(row, "iqa_nima_ava"),
                 self._optional_float(row, "iqa_hyperiqa"),
@@ -254,12 +257,13 @@ class WandbLogger:
                     "clean_pred",
                     "adv_pred",
                     "success",
-                    "semantic_success",
                     "clean_true_conf",
                     "adv_true_conf",
                     "confidence_drop",
                     "logit_gap_drop",
+                    "semantic_similarity",
                     "dino_similarity",
+                    "clip_image_similarity",
                     "ssim",
                     "NIMA-AVA",
                     "HyperIQA",

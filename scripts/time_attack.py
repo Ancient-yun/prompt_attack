@@ -104,7 +104,8 @@ def main() -> None:
                 "seconds": elapsed,
                 "seconds_per_step": elapsed / config.attack.steps,
                 "success": bool(row["success"]),
-                "dino_similarity": float(row["dino_similarity"]),
+                "semantic_similarity": float(row["semantic_similarity"]),
+                "semantic_metric": str(row["semantic_metric"]),
             }
         )
 

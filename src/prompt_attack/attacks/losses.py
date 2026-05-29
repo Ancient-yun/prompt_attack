@@ -90,11 +90,40 @@ def is_cr_dino_objective(objective: str) -> bool:
 
 
 def is_margin_dino_constraint_objective(objective: str) -> bool:
-    """Return whether the objective should use bounded attack plus DINO constraint."""
+    """Return whether the objective should use bounded attack plus image similarity."""
     return _normalized_objective(objective) in {
+        "margin_dino",
+        "margin_dino_img2img",
         "margin_dino_constraint",
         "hinge_dino_constraint",
+        "margin_clip",
+        "margin_clip_img2img",
+        "margin_clip_image",
+        "margin_clip_image_to_image",
+    }
+
+
+def uses_clip_image_similarity(objective: str) -> bool:
+    """Return whether the objective expects CLIP image-to-image similarity."""
+    return _normalized_objective(objective) in {
+        "margin_clip",
+        "margin_clip_img2img",
+        "margin_clip_image",
+        "margin_clip_image_to_image",
+    }
+
+
+def uses_dino_similarity(objective: str) -> bool:
+    """Return whether the objective expects DINO image-to-image similarity."""
+    normalized = _normalized_objective(objective)
+    return normalized in {
+        "classification_rejection_dino",
+        "classification_rejection_with_dino",
+        "cr_dino",
         "margin_dino",
+        "margin_dino_img2img",
+        "margin_dino_constraint",
+        "hinge_dino_constraint",
     }
 
 
@@ -142,17 +171,9 @@ def weighted_attack_semantic_loss(attack_loss, semantic_loss, lambda_sem: float)
     return (1.0 - lambda_sem) * attack_loss + lambda_sem * semantic_loss
 
 
-def dino_loss(similarity):
-    """Return 1 - cosine similarity."""
-    return 1.0 - similarity.mean()
-
-
-def dino_constraint_loss(similarity, threshold: float, *, reduction: str = "mean"):
-    """Return squared penalty only when DINO similarity is below threshold."""
-    import torch
-
-    loss = torch.relu(threshold - similarity).square()
-    return _reduce_loss(loss, reduction)
+def semantic_image_loss(similarity, *, reduction: str = "mean"):
+    """Return a continuous image-to-image preservation loss."""
+    return _reduce_loss(1.0 - similarity, reduction)
 
 
 def objective_loss_components(
@@ -160,45 +181,40 @@ def objective_loss_components(
     true_label: Any,
     objective: str,
     *,
-    dino_similarity=None,
+    semantic_similarity=None,
     lambda_sem: float,
-    semantic_threshold: float,
-    semantic_penalty_weight: float,
+    semantic_loss_weight: float,
     attack_margin: float,
 ) -> tuple[Any, Any, Any, Any]:
-    """Return per-sample attack, DINO, semantic-penalty, and total losses."""
+    """Return per-sample attack, semantic, weighted-semantic, and total losses."""
     import torch
 
     if is_margin_dino_constraint_objective(objective):
-        if dino_similarity is None:
-            raise ValueError("margin_dino_constraint requires dino_similarity.")
+        if semantic_similarity is None:
+            raise ValueError(f"{objective} requires image-to-image semantic similarity.")
         attack_losses = margin_hinge_loss(
             logits,
             true_label,
             margin=attack_margin,
             reduction="none",
         )
-        semantic_losses = dino_constraint_loss(
-            dino_similarity,
-            semantic_threshold,
-            reduction="none",
-        )
-        dino_losses = 1.0 - dino_similarity
-        total_losses = attack_losses + semantic_penalty_weight * semantic_losses
-        return attack_losses, dino_losses, semantic_losses, total_losses
+        semantic_losses = semantic_image_loss(semantic_similarity, reduction="none")
+        weighted_semantic_losses = semantic_loss_weight * semantic_losses
+        total_losses = attack_losses + weighted_semantic_losses
+        return attack_losses, semantic_losses, weighted_semantic_losses, total_losses
 
     attack_losses = attack_loss_from_objective(logits, true_label, objective, reduction="none")
     attack_loss_weight, semantic_loss_weight = attack_semantic_loss_weights(objective, lambda_sem)
-    if dino_similarity is not None:
-        dino_losses = 1.0 - dino_similarity
-    else:
-        dino_losses = torch.zeros_like(attack_losses)
-    if semantic_loss_weight > 0:
-        if dino_similarity is None:
-            raise ValueError(f"{objective} requires dino_similarity.")
-        semantic_losses = dino_losses
-        total_losses = attack_loss_weight * attack_losses + semantic_loss_weight * dino_losses
+    if semantic_similarity is not None:
+        semantic_losses = semantic_image_loss(semantic_similarity, reduction="none")
     else:
         semantic_losses = torch.zeros_like(attack_losses)
+    if semantic_loss_weight > 0:
+        if semantic_similarity is None:
+            raise ValueError(f"{objective} requires image-to-image semantic similarity.")
+        weighted_semantic_losses = semantic_loss_weight * semantic_losses
+        total_losses = attack_loss_weight * attack_losses + weighted_semantic_losses
+    else:
+        weighted_semantic_losses = torch.zeros_like(attack_losses)
         total_losses = attack_losses
-    return attack_losses, dino_losses, semantic_losses, total_losses
+    return attack_losses, semantic_losses, weighted_semantic_losses, total_losses

@@ -12,9 +12,9 @@ class MetricSummary:
     count: int
     success_count: int
     asr: float
-    semantic_constrained_success_count: int
-    semantic_constrained_asr: float
+    mean_semantic_similarity: float
     mean_dino_similarity: float
+    mean_clip_image_similarity: float | None
     mean_ssim: float
     mean_decision_logit_gap_drop: float
     mean_confidence_drop: float
@@ -54,9 +54,9 @@ def summarize_rows(rows: Sequence[Mapping[str, object]], *, fid: float | None = 
             count=0,
             success_count=0,
             asr=0.0,
-            semantic_constrained_success_count=0,
-            semantic_constrained_asr=0.0,
+            mean_semantic_similarity=0.0,
             mean_dino_similarity=0.0,
+            mean_clip_image_similarity=None,
             mean_ssim=0.0,
             mean_decision_logit_gap_drop=0.0,
             mean_confidence_drop=0.0,
@@ -73,8 +73,10 @@ def summarize_rows(rows: Sequence[Mapping[str, object]], *, fid: float | None = 
             mean_runtime_seconds=0.0,
         )
     success_count = sum(1 for row in rows if _as_bool(row["success"]))
-    semantic_success_count = sum(1 for row in rows if _as_bool(row["semantic_constrained_success"]))
-    dino = [float(cast(Any, row["dino_similarity"])) for row in rows]
+    semantic = [float(cast(Any, row["semantic_similarity"])) for row in rows]
+    dino_values = [row.get("dino_similarity") for row in rows]
+    dino = [float(cast(Any, value)) for value in dino_values if value not in {None, ""}]
+    clip = _mean_optional(rows, "clip_image_similarity")
     ssim = [float(cast(Any, row["ssim"])) for row in rows]
     margin = [float(cast(Any, row["margin_drop"])) for row in rows]
     confidence = [float(cast(Any, row["confidence_drop"])) for row in rows]
@@ -87,9 +89,9 @@ def summarize_rows(rows: Sequence[Mapping[str, object]], *, fid: float | None = 
         count=len(rows),
         success_count=success_count,
         asr=success_count / len(rows),
-        semantic_constrained_success_count=semantic_success_count,
-        semantic_constrained_asr=semantic_success_count / len(rows),
-        mean_dino_similarity=sum(dino) / len(dino),
+        mean_semantic_similarity=sum(semantic) / len(semantic),
+        mean_dino_similarity=sum(dino) / len(dino) if dino else 0.0,
+        mean_clip_image_similarity=clip,
         mean_ssim=sum(ssim) / len(ssim),
         mean_decision_logit_gap_drop=sum(margin) / len(margin),
         mean_confidence_drop=sum(confidence) / len(confidence),

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from prompt_attack.attacks.losses import (
     attack_semantic_loss_weights,
     attack_loss_from_objective,
-    dino_constraint_loss,
+    semantic_image_loss,
     margin_hinge_loss,
     objective_loss_components,
     cr_loss,
@@ -83,6 +83,7 @@ def test_cr_loss_matches_classification_rejection_term() -> None:
     assert is_cr_objective("classification-rejection")
     assert is_cr_dino_objective("cr-dino")
     assert is_margin_dino_constraint_objective("margin-dino-constraint")
+    assert is_margin_dino_constraint_objective("margin-clip-img2img")
 
 
 def test_cr_objective_disables_semantic_loss_weight() -> None:
@@ -108,34 +109,54 @@ def test_margin_hinge_loss_is_zero_after_attack_success() -> None:
     assert torch.allclose(losses, torch.tensor([0.0, 2.0]))
 
 
-def test_dino_constraint_loss_penalizes_only_below_threshold() -> None:
+def test_semantic_image_loss_is_continuous() -> None:
     similarity = torch.tensor([0.90, 0.70])
 
-    losses = dino_constraint_loss(similarity, threshold=0.85, reduction="none")
+    losses = semantic_image_loss(similarity, reduction="none")
 
-    assert torch.allclose(losses, torch.tensor([0.0, 0.15**2]))
+    assert torch.allclose(losses, torch.tensor([0.10, 0.30]))
 
 
-def test_margin_dino_constraint_loss_components_are_batched() -> None:
+def test_margin_dino_loss_components_are_batched() -> None:
     logits = torch.tensor([[1.0, 3.0, 0.0], [4.0, 1.0, 2.0]])
     labels = torch.tensor([0, 0])
-    dino_similarity = torch.tensor([0.90, 0.70])
+    semantic_similarity = torch.tensor([0.90, 0.70])
 
-    attack, dino, penalty, total = objective_loss_components(
+    attack, semantic, weighted_semantic, total = objective_loss_components(
         logits,
         labels,
-        "margin_dino_constraint",
-        dino_similarity=dino_similarity,
+        "margin_dino",
+        semantic_similarity=semantic_similarity,
         lambda_sem=0.5,
-        semantic_threshold=0.85,
-        semantic_penalty_weight=10.0,
+        semantic_loss_weight=10.0,
         attack_margin=0.0,
     )
 
     assert torch.allclose(attack, torch.tensor([0.0, 2.0]))
-    assert torch.allclose(dino, torch.tensor([0.10, 0.30]))
-    assert torch.allclose(penalty, torch.tensor([0.0, 0.15**2]))
-    assert torch.allclose(total, attack + 10.0 * penalty)
+    assert torch.allclose(semantic, torch.tensor([0.10, 0.30]))
+    assert torch.allclose(weighted_semantic, 10.0 * semantic)
+    assert torch.allclose(total, attack + weighted_semantic)
+
+
+def test_margin_clip_img2img_loss_uses_same_continuous_similarity_form() -> None:
+    logits = torch.tensor([[1.0, 3.0, 0.0]])
+    labels = torch.tensor([0])
+    clip_similarity = torch.tensor([0.75])
+
+    attack, semantic, weighted_semantic, total = objective_loss_components(
+        logits,
+        labels,
+        "margin_clip_img2img",
+        semantic_similarity=clip_similarity,
+        lambda_sem=0.0,
+        semantic_loss_weight=3.0,
+        attack_margin=0.0,
+    )
+
+    assert torch.allclose(attack, torch.tensor([0.0]))
+    assert torch.allclose(semantic, torch.tensor([0.25]))
+    assert torch.allclose(weighted_semantic, torch.tensor([0.75]))
+    assert torch.allclose(total, torch.tensor([0.75]))
 
 
 def test_micro_batch_scaled_loss_matches_global_batch_mean() -> None:
@@ -148,15 +169,14 @@ def test_micro_batch_scaled_loss_matches_global_batch_mean() -> None:
         ]
     )
     labels = torch.tensor([0, 0, 1, 2])
-    dino_similarity = torch.tensor([0.90, 0.70, 0.80, 0.95])
+    semantic_similarity = torch.tensor([0.90, 0.70, 0.80, 0.95])
     _, _, _, full_total = objective_loss_components(
         logits,
         labels,
-        "margin_dino_constraint",
-        dino_similarity=dino_similarity,
+        "margin_dino",
+        semantic_similarity=semantic_similarity,
         lambda_sem=0.0,
-        semantic_threshold=0.85,
-        semantic_penalty_weight=10.0,
+        semantic_loss_weight=10.0,
         attack_margin=0.0,
     )
     accumulated = torch.tensor(0.0)
@@ -164,11 +184,10 @@ def test_micro_batch_scaled_loss_matches_global_batch_mean() -> None:
         _, _, _, micro_total = objective_loss_components(
             logits[start : start + 2],
             labels[start : start + 2],
-            "margin_dino_constraint",
-            dino_similarity=dino_similarity[start : start + 2],
+            "margin_dino",
+            semantic_similarity=semantic_similarity[start : start + 2],
             lambda_sem=0.0,
-            semantic_threshold=0.85,
-            semantic_penalty_weight=10.0,
+            semantic_loss_weight=10.0,
             attack_margin=0.0,
         )
         accumulated = accumulated + micro_total.sum() / len(labels)

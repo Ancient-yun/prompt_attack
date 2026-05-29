@@ -5,8 +5,9 @@ def test_summary_includes_optional_quality_metrics() -> None:
     rows = [
         {
             "success": True,
-            "semantic_constrained_success": True,
+            "semantic_similarity": 0.9,
             "dino_similarity": 0.9,
+            "clip_image_similarity": "",
             "ssim": 0.8,
             "margin_drop": 1.0,
             "confidence_drop": 0.2,
@@ -26,6 +27,9 @@ def test_summary_includes_optional_quality_metrics() -> None:
     summary = summarize_rows(rows, fid=12.5)
 
     assert summary.asr == 1.0
+    assert summary.mean_semantic_similarity == 0.9
+    assert summary.mean_dino_similarity == 0.9
+    assert summary.mean_clip_image_similarity is None
     assert summary.mean_decision_logit_gap_drop == 1.0
     assert summary.mean_iqa_nima_ava == 4.0
     assert summary.mean_iqa_hyperiqa is None
@@ -37,7 +41,9 @@ def test_summary_includes_optional_quality_metrics() -> None:
 
 def test_summary_parses_csv_boolean_strings() -> None:
     base = {
+        "semantic_similarity": 0.9,
         "dino_similarity": 0.9,
+        "clip_image_similarity": 0.8,
         "ssim": 0.8,
         "margin_drop": 1.0,
         "confidence_drop": 0.2,
@@ -51,12 +57,10 @@ def test_summary_parses_csv_boolean_strings() -> None:
         {
             **base,
             "success": "True",
-            "semantic_constrained_success": "False",
         },
         {
             **base,
             "success": "False",
-            "semantic_constrained_success": "False",
         },
     ]
 
@@ -64,4 +68,5 @@ def test_summary_parses_csv_boolean_strings() -> None:
 
     assert summary.success_count == 1
     assert summary.asr == 0.5
-    assert summary.semantic_constrained_success_count == 0
+    assert summary.mean_semantic_similarity == 0.9
+    assert summary.mean_clip_image_similarity == 0.8

@@ -17,6 +17,7 @@ from tqdm import tqdm
 from prompt_attack.attacks.learnable_tokens import build_prompt
 from prompt_attack.attacks.losses import (
     attack_semantic_loss_weights,
+    is_margin_dino_constraint_objective,
     objective_loss_components,
 )
 from prompt_attack.config import ExperimentConfig
@@ -62,6 +63,30 @@ def _progress_eta(*, started_at: float, completed: int, total: int) -> tuple[flo
     remaining = max(total - completed, 0)
     eta = elapsed / completed * remaining
     return elapsed, eta
+
+
+def _semantic_metric_fields(semantic: Any, value: float) -> dict[str, Any]:
+    """Return generic and model-specific semantic similarity CSV fields."""
+    metric_name = str(getattr(semantic, "metric_name", "semantic_similarity"))
+    fields: dict[str, Any] = {
+        "semantic_model": str(getattr(semantic, "name", type(semantic).__name__)),
+        "semantic_metric": metric_name,
+        "semantic_similarity": value,
+        "dino_similarity": "",
+        "clip_image_similarity": "",
+    }
+    if metric_name == "dino_similarity":
+        fields["dino_similarity"] = value
+    elif metric_name == "clip_image_similarity":
+        fields["clip_image_similarity"] = value
+    return fields
+
+
+def _logged_semantic_weight(config: ExperimentConfig, objective_weight: float) -> float:
+    """Return the semantic loss weight that actually scales the configured objective."""
+    if is_margin_dino_constraint_objective(config.attack.objective):
+        return config.attack.semantic_loss_weight
+    return objective_weight
 
 
 @dataclass(frozen=True)
@@ -471,8 +496,8 @@ class LearnableTokenAttackRunner:
             optimizer.zero_grad(set_to_none=True)
             current_lr = float(optimizer.param_groups[0]["lr"])
             step_attack_loss = 0.0
-            step_dino_loss = 0.0
-            step_semantic_penalty_loss = 0.0
+            step_semantic_loss = 0.0
+            step_weighted_semantic_loss = 0.0
             step_total_loss = 0.0
             step_success = 0
             processed = 0
@@ -492,20 +517,19 @@ class LearnableTokenAttackRunner:
                 if not isinstance(image_tensor, torch.Tensor):
                     raise TypeError("Generator batch result must expose torch.Tensor image_tensor.")
                 logits = components.victim.logits_from_tensor(image_tensor)
-                dino_sim = (
+                semantic_sim = (
                     components.semantic.similarity(original_tensor, image_tensor)
                     if semantic_loss_weight > 0
                     else None
                 )
-                attack_losses, dino_losses, semantic_penalty_losses, total_losses = (
+                attack_losses, semantic_losses, weighted_semantic_losses, total_losses = (
                     objective_loss_components(
                         logits,
                         true_labels,
                         self.config.attack.objective,
-                        dino_similarity=dino_sim,
+                        semantic_similarity=semantic_sim,
                         lambda_sem=self.config.attack.lambda_sem,
-                        semantic_threshold=self.config.attack.semantic_threshold,
-                        semantic_penalty_weight=self.config.attack.semantic_penalty_weight,
+                        semantic_loss_weight=self.config.attack.semantic_loss_weight,
                         attack_margin=self.config.attack.attack_margin,
                     )
                 )
@@ -521,9 +545,9 @@ class LearnableTokenAttackRunner:
                         true_labels.detach().cpu().tolist(),
                 )
                 step_attack_loss += float(attack_losses.detach().sum().cpu().item())
-                step_dino_loss += float(dino_losses.detach().sum().cpu().item())
-                step_semantic_penalty_loss += float(
-                    semantic_penalty_losses.detach().sum().cpu().item()
+                step_semantic_loss += float(semantic_losses.detach().sum().cpu().item())
+                step_weighted_semantic_loss += float(
+                    weighted_semantic_losses.detach().sum().cpu().item()
                 )
                 step_total_loss += float(total_losses.detach().sum().cpu().item())
                 step_success += sum(
@@ -538,8 +562,8 @@ class LearnableTokenAttackRunner:
             stats = torch.tensor(
                 [
                     step_attack_loss,
-                    step_dino_loss,
-                    step_semantic_penalty_loss,
+                    step_semantic_loss,
+                    step_weighted_semantic_loss,
                     step_total_loss,
                     step_success,
                     processed,
@@ -560,8 +584,8 @@ class LearnableTokenAttackRunner:
                 "batch_index": batch_index,
                 "lr": current_lr,
                 "attack_loss": float(stats[0].detach().cpu().item()) / global_processed,
-                "dino_loss": float(stats[1].detach().cpu().item()) / global_processed,
-                "semantic_penalty_loss": float(stats[2].detach().cpu().item())
+                "semantic_loss": float(stats[1].detach().cpu().item()) / global_processed,
+                "weighted_semantic_loss": float(stats[2].detach().cpu().item())
                 / global_processed,
                 "total_loss": float(stats[3].detach().cpu().item()) / global_processed,
                 "success_rate": float(stats[4].detach().cpu().item()) / global_processed,
@@ -610,8 +634,8 @@ class LearnableTokenAttackRunner:
                     attack_step=step,
                     values={
                         "attack_loss": history_row["attack_loss"],
-                        "semantic_loss": history_row["dino_loss"],
-                        "semantic_penalty_loss": history_row["semantic_penalty_loss"],
+                        "semantic_loss": history_row["semantic_loss"],
+                        "weighted_semantic_loss": history_row["weighted_semantic_loss"],
                         "total_loss": history_row["total_loss"],
                         "lr": current_lr,
                         "success_rate": history_row["success_rate"],
@@ -648,7 +672,6 @@ class LearnableTokenAttackRunner:
         clean_correct_count = 0
         success_count = 0
         clean_success_count = 0
-        semantic_success_count = 0
         progress = tqdm(
             batches,
             desc=f"{stage}-eval",
@@ -681,16 +704,15 @@ class LearnableTokenAttackRunner:
                     adv_logits,
                     true_labels.detach().cpu().tolist(),
                 )
-                dino_sim = components.semantic.similarity(original_tensor, image_tensor)
-                attack_losses, dino_losses, semantic_penalty_losses, total_losses = (
+                semantic_sim = components.semantic.similarity(original_tensor, image_tensor)
+                attack_losses, semantic_losses, weighted_semantic_losses, total_losses = (
                     objective_loss_components(
                         adv_logits,
                         true_labels,
                         self.config.attack.objective,
-                        dino_similarity=dino_sim,
+                        semantic_similarity=semantic_sim,
                         lambda_sem=self.config.attack.lambda_sem,
-                        semantic_threshold=self.config.attack.semantic_threshold,
-                        semantic_penalty_weight=self.config.attack.semantic_penalty_weight,
+                        semantic_loss_weight=self.config.attack.semantic_loss_weight,
                         attack_margin=self.config.attack.attack_margin,
                     )
                 )
@@ -717,8 +739,7 @@ class LearnableTokenAttackRunner:
                 adv_one = image_tensor[index : index + 1]
                 success = adv_eval.pred != record.class_index
                 clean_correct = clean_eval.pred == record.class_index
-                dino_value = float(dino_sim[index].detach().cpu().item())
-                semantic_constrained_success = success and dino_value >= self.config.attack.semantic_threshold
+                semantic_value = float(semantic_sim[index].detach().cpu().item())
                 pixel_metrics = pixel_distance_metrics(original_one, adv_one)
                 ssim = global_ssim(original_one, adv_one)
                 nriqa_metrics = (
@@ -748,9 +769,10 @@ class LearnableTokenAttackRunner:
                     "steps": self.config.attack.steps,
                     "lambda_sem": self.config.attack.lambda_sem,
                     "attack_loss_weight": attack_loss_weight,
-                    "semantic_loss_weight": semantic_loss_weight,
-                    "semantic_threshold": self.config.attack.semantic_threshold,
-                    "semantic_penalty_weight": self.config.attack.semantic_penalty_weight,
+                    "semantic_loss_weight": _logged_semantic_weight(
+                        self.config,
+                        semantic_loss_weight,
+                    ),
                     "attack_margin": self.config.attack.attack_margin,
                     "objective": self.config.attack.objective,
                     "attack_batch_size": self.config.attack.batch_size,
@@ -766,34 +788,31 @@ class LearnableTokenAttackRunner:
                     "adv_pred_label": components.victim.categories[adv_eval.pred],
                     "adv_top1_conf": adv_eval.pred_conf,
                     "success": success,
-                    "semantic_constrained_success": semantic_constrained_success,
                     "clean_true_conf": clean_eval.true_conf,
                     "adv_true_conf": adv_eval.true_conf,
                     "confidence_drop": clean_eval.true_conf - adv_eval.true_conf,
                     "clean_margin": clean_eval.margin,
                     "adv_margin": adv_eval.margin,
                     "margin_drop": clean_eval.margin - adv_eval.margin,
-                    "dino_similarity": dino_value,
-                    "dino_loss": float(dino_losses[index].detach().cpu().item()),
-                    "semantic_penalty_loss": float(
-                        semantic_penalty_losses[index].detach().cpu().item()
+                    **_semantic_metric_fields(components.semantic, semantic_value),
+                    "semantic_loss": float(semantic_losses[index].detach().cpu().item()),
+                    "weighted_semantic_loss": float(
+                        weighted_semantic_losses[index].detach().cpu().item()
                     ),
                     "ssim": ssim,
                     **pixel_metrics,
                     **nriqa_metrics,
                     "best_step": final_step,
                     "best_attack_step": final_step,
-                    "best_semantic_success_step": final_step if semantic_constrained_success else -1,
                     "first_success_step": final_step if success else -1,
-                    "first_semantic_success_step": final_step if semantic_constrained_success else -1,
                     "min_adv_true_conf": adv_eval.true_conf,
                     "min_adv_true_conf_step": final_step,
                     "min_adv_margin": adv_eval.margin,
                     "min_adv_margin_step": final_step,
                     "best_attack_loss": float(attack_losses[index].detach().cpu().item()),
-                    "best_dino_loss": float(dino_losses[index].detach().cpu().item()),
-                    "best_semantic_penalty_loss": float(
-                        semantic_penalty_losses[index].detach().cpu().item()
+                    "best_semantic_loss": float(semantic_losses[index].detach().cpu().item()),
+                    "best_weighted_semantic_loss": float(
+                        weighted_semantic_losses[index].detach().cpu().item()
                     ),
                     "best_total_loss": float(total_losses[index].detach().cpu().item()),
                     "runtime_seconds": runtime_seconds,
@@ -810,7 +829,6 @@ class LearnableTokenAttackRunner:
                 clean_correct_count += int(clean_correct)
                 success_count += int(success)
                 clean_success_count += int(clean_correct and success)
-                semantic_success_count += int(semantic_constrained_success)
             if show_progress:
                 elapsed, eta = _progress_eta(
                     started_at=eval_started_at,
@@ -838,7 +856,6 @@ class LearnableTokenAttackRunner:
                     f"images={seen}/{len(records)} ({seen / max(len(records), 1):.1%}) | "
                     f"clean_correct={clean_correct_count} | "
                     f"success={success_count} | "
-                    f"semantic_success={semantic_success_count} | "
                     f"asr={asr:.3f} | "
                     f"clean_asr={clean_asr:.3f} | "
                     f"elapsed={_format_duration(elapsed)} | "
@@ -929,7 +946,8 @@ class LearnableTokenAttackRunner:
                     "lambda_sem": self.config.attack.lambda_sem,
                     "learnable_token_initializer": self.config.attack.learnable_token_initializer,
                     "learnable_token_init_seed": self.config.attack.learnable_token_init_seed,
-                    "semantic_penalty_weight": self.config.attack.semantic_penalty_weight,
+                    "semantic_model": self.config.semantic.name,
+                    "semantic_loss_weight": self.config.attack.semantic_loss_weight,
                     "attack_margin": self.config.attack.attack_margin,
                     "lr": self.config.attack.lr,
                 },
@@ -980,10 +998,8 @@ class LearnableTokenAttackRunner:
         seed = stable_image_seed(0, record.image_id)
         best: dict[str, Any] | None = None
         best_attack: dict[str, Any] | None = None
-        best_semantic_success: dict[str, Any] | None = None
         min_true_conf: dict[str, Any] | None = None
         first_success_step = -1
-        first_semantic_success_step = -1
 
         for step in range(self.config.attack.steps):
             optimizer.zero_grad(set_to_none=True)
@@ -996,26 +1012,25 @@ class LearnableTokenAttackRunner:
                 require_grad=True,
             )
             logits = victim.logits_from_tensor(generated.image_tensor)
-            dino_sim = None
-            dino_loss_value = None
-            semantic_penalty_loss = None
+            semantic_sim = None
+            semantic_loss_value = None
+            weighted_semantic_loss = None
             if semantic_loss_weight > 0:
-                dino_sim = semantic.similarity(original_tensor, generated.image_tensor)
-            attack_losses, dino_losses, semantic_penalty_losses, total_losses = (
+                semantic_sim = semantic.similarity(original_tensor, generated.image_tensor)
+            attack_losses, semantic_losses, weighted_semantic_losses, total_losses = (
                 objective_loss_components(
                     logits,
                     record.class_index,
                     self.config.attack.objective,
-                    dino_similarity=dino_sim,
+                    semantic_similarity=semantic_sim,
                     lambda_sem=self.config.attack.lambda_sem,
-                    semantic_threshold=self.config.attack.semantic_threshold,
-                    semantic_penalty_weight=self.config.attack.semantic_penalty_weight,
+                    semantic_loss_weight=self.config.attack.semantic_loss_weight,
                     attack_margin=self.config.attack.attack_margin,
                 )
             )
             attack_loss = attack_losses.mean()
-            dino_loss_value = dino_losses.mean()
-            semantic_penalty_loss = semantic_penalty_losses.mean()
+            semantic_loss_value = semantic_losses.mean()
+            weighted_semantic_loss = weighted_semantic_losses.mean()
             total_loss = total_losses.mean()
             if not torch.isfinite(total_loss):
                 raise FloatingPointError(f"Non-finite loss for {record.image_id} at step {step}")
@@ -1027,32 +1042,33 @@ class LearnableTokenAttackRunner:
 
             eval_result = victim.evaluate_logits(logits.detach(), record.class_index)
             success = eval_result.pred != record.class_index
-            if dino_sim is None:
+            if semantic_sim is None:
                 with torch.no_grad():
-                    dino_sim = semantic.similarity(original_tensor, generated.image_tensor.detach())
-                    dino_loss_value = 1.0 - dino_sim.mean()
-            semantic_constrained_success = (
-                success and float(dino_sim.detach().cpu().item()) >= self.config.attack.semantic_threshold
-            )
+                    semantic_sim = semantic.similarity(
+                        original_tensor,
+                        generated.image_tensor.detach(),
+                    )
+                    semantic_loss_value = 1.0 - semantic_sim.mean()
+                    weighted_semantic_loss = semantic_loss_weight * semantic_loss_value
+            semantic_value = float(semantic_sim.detach().cpu().item())
             current = {
                 "step": step,
                 "image_tensor": generated.image_tensor.detach(),
                 "attack_loss": float(attack_loss.detach().cpu().item()),
-                "dino_loss": float(dino_loss_value.detach().cpu().item()),
-                "semantic_penalty_loss": float(semantic_penalty_loss.detach().cpu().item()),
+                "semantic_loss": float(semantic_loss_value.detach().cpu().item()),
+                "weighted_semantic_loss": float(
+                    weighted_semantic_loss.detach().cpu().item()
+                ),
                 "total_loss": float(total_loss.detach().cpu().item()),
                 "adv_pred": eval_result.pred,
                 "adv_top1_conf": eval_result.pred_conf,
                 "adv_true_conf": eval_result.true_conf,
                 "adv_margin": eval_result.margin,
-                "dino_similarity": float(dino_sim.detach().cpu().item()),
+                "semantic_similarity": semantic_value,
                 "success": success,
-                "semantic_constrained_success": semantic_constrained_success,
             }
             if success and first_success_step < 0:
                 first_success_step = step
-            if semantic_constrained_success and first_semantic_success_step < 0:
-                first_semantic_success_step = step
             if logger is not None:
                 logger.log_step(
                     image_index=image_index,
@@ -1062,18 +1078,20 @@ class LearnableTokenAttackRunner:
                     values={
                         "attack_loss": current["attack_loss"],
                         "attack_objective_loss": current["attack_loss"],
-                        "semantic_loss": current["dino_loss"],
+                        "semantic_loss": current["semantic_loss"],
                         "attack_loss_weight": attack_loss_weight,
-                        "semantic_loss_weight": semantic_loss_weight,
+                        "semantic_loss_weight": _logged_semantic_weight(
+                            self.config,
+                            semantic_loss_weight,
+                        ),
                         "total_loss": current["total_loss"],
                         "lr": current_lr,
                         "true_conf": current["adv_true_conf"],
                         "confidence_drop": clean_eval.true_conf - current["adv_true_conf"],
                         "top1_conf": current["adv_top1_conf"],
                         "logit_gap_true_vs_other": current["adv_margin"],
-                        "dino_similarity": current["dino_similarity"],
+                        "semantic_similarity": current["semantic_similarity"],
                         "success": int(success),
-                        "semantic_constrained_success": int(semantic_constrained_success),
                     },
                 )
             if best is None or current["total_loss"] < best["total_loss"]:
@@ -1082,11 +1100,6 @@ class LearnableTokenAttackRunner:
                 best_attack = current
             if min_true_conf is None or current["adv_true_conf"] < min_true_conf["adv_true_conf"]:
                 min_true_conf = current
-            if semantic_constrained_success and (
-                best_semantic_success is None
-                or current["adv_margin"] < best_semantic_success["adv_margin"]
-            ):
-                best_semantic_success = current
 
         if best is None or best_attack is None or min_true_conf is None:
             raise RuntimeError(f"No optimization step ran for {record.image_id}")
@@ -1102,9 +1115,6 @@ class LearnableTokenAttackRunner:
 
         success = int(best["adv_pred"]) != record.class_index
         confidence_drop = clean_eval.true_conf - float(best["adv_true_conf"])
-        semantic_constrained_success = (
-            success and float(best["dino_similarity"]) >= self.config.attack.semantic_threshold
-        )
         pixel_metrics = pixel_distance_metrics(original_tensor, best["image_tensor"])
         ssim = global_ssim(original_tensor, best["image_tensor"])
         nriqa_metrics = (
@@ -1134,9 +1144,7 @@ class LearnableTokenAttackRunner:
             "steps": self.config.attack.steps,
             "lambda_sem": self.config.attack.lambda_sem,
             "attack_loss_weight": attack_loss_weight,
-            "semantic_loss_weight": semantic_loss_weight,
-            "semantic_threshold": self.config.attack.semantic_threshold,
-            "semantic_penalty_weight": self.config.attack.semantic_penalty_weight,
+            "semantic_loss_weight": _logged_semantic_weight(self.config, semantic_loss_weight),
             "attack_margin": self.config.attack.attack_margin,
             "objective": self.config.attack.objective,
             "attack_batch_size": self.config.attack.batch_size,
@@ -1151,31 +1159,28 @@ class LearnableTokenAttackRunner:
             "adv_pred_label": victim.categories[int(best["adv_pred"])],
             "adv_top1_conf": float(best["adv_top1_conf"]),
             "success": success,
-            "semantic_constrained_success": semantic_constrained_success,
             "clean_true_conf": clean_eval.true_conf,
             "adv_true_conf": float(best["adv_true_conf"]),
             "confidence_drop": confidence_drop,
             "clean_margin": clean_eval.margin,
             "adv_margin": float(best["adv_margin"]),
             "margin_drop": clean_eval.margin - float(best["adv_margin"]),
-            "dino_similarity": float(best["dino_similarity"]),
+            **_semantic_metric_fields(semantic, float(best["semantic_similarity"])),
+            "semantic_loss": float(best["semantic_loss"]),
+            "weighted_semantic_loss": float(best["weighted_semantic_loss"]),
             "ssim": ssim,
             **pixel_metrics,
             **nriqa_metrics,
             "best_step": int(best["step"]),
             "best_attack_step": int(best_attack["step"]),
-            "best_semantic_success_step": (
-                -1 if best_semantic_success is None else int(best_semantic_success["step"])
-            ),
             "first_success_step": first_success_step,
-            "first_semantic_success_step": first_semantic_success_step,
             "min_adv_true_conf": float(min_true_conf["adv_true_conf"]),
             "min_adv_true_conf_step": int(min_true_conf["step"]),
             "min_adv_margin": float(best_attack["adv_margin"]),
             "min_adv_margin_step": int(best_attack["step"]),
             "best_attack_loss": float(best["attack_loss"]),
-            "best_dino_loss": float(best["dino_loss"]),
-            "best_semantic_penalty_loss": float(best["semantic_penalty_loss"]),
+            "best_semantic_loss": float(best["semantic_loss"]),
+            "best_weighted_semantic_loss": float(best["weighted_semantic_loss"]),
             "best_total_loss": float(best["total_loss"]),
             "runtime_seconds": runtime_seconds,
             "output_image_path": str(output_dir / "adv.png"),
@@ -1247,10 +1252,8 @@ class LearnableTokenAttackRunner:
         seeds = [stable_image_seed(0, record.image_id) for record in records]
         best: list[dict[str, Any] | None] = [None] * len(records)
         best_attack: list[dict[str, Any] | None] = [None] * len(records)
-        best_semantic_success: list[dict[str, Any] | None] = [None] * len(records)
         min_true_conf: list[dict[str, Any] | None] = [None] * len(records)
         first_success_step = [-1] * len(records)
-        first_semantic_success_step = [-1] * len(records)
 
         for step in range(self.config.attack.steps):
             optimizer.zero_grad(set_to_none=True)
@@ -1270,18 +1273,17 @@ class LearnableTokenAttackRunner:
                     f"Generator returned batch size {image_tensor.shape[0]} for {len(records)} records."
                 )
             logits = victim.logits_from_tensor(image_tensor)
-            dino_sim = None
+            semantic_sim = None
             if semantic_loss_weight > 0:
-                dino_sim = semantic.similarity(original_tensor, image_tensor)
-            attack_losses, dino_losses, semantic_penalty_losses, total_losses = (
+                semantic_sim = semantic.similarity(original_tensor, image_tensor)
+            attack_losses, semantic_losses, weighted_semantic_losses, total_losses = (
                 objective_loss_components(
                     logits,
                     true_labels,
                     self.config.attack.objective,
-                    dino_similarity=dino_sim,
+                    semantic_similarity=semantic_sim,
                     lambda_sem=self.config.attack.lambda_sem,
-                    semantic_threshold=self.config.attack.semantic_threshold,
-                    semantic_penalty_weight=self.config.attack.semantic_penalty_weight,
+                    semantic_loss_weight=self.config.attack.semantic_loss_weight,
                     attack_margin=self.config.attack.attack_margin,
                 )
             )
@@ -1295,38 +1297,33 @@ class LearnableTokenAttackRunner:
                 lr_scheduler.step()
 
             eval_results = victim.evaluate_logits_batch(logits.detach(), true_labels.detach().cpu().tolist())
-            if dino_sim is None:
+            if semantic_sim is None:
                 with torch.no_grad():
-                    dino_sim = semantic.similarity(original_tensor, image_tensor.detach())
-                    dino_losses = 1.0 - dino_sim
+                    semantic_sim = semantic.similarity(original_tensor, image_tensor.detach())
+                    semantic_losses = 1.0 - semantic_sim
+                    weighted_semantic_losses = semantic_loss_weight * semantic_losses
             for index, record in enumerate(records):
                 eval_result = eval_results[index]
                 success = eval_result.pred != record.class_index
-                semantic_value = float(dino_sim[index].detach().cpu().item())
-                semantic_constrained_success = (
-                    success and semantic_value >= self.config.attack.semantic_threshold
-                )
+                semantic_value = float(semantic_sim[index].detach().cpu().item())
                 current = {
                     "step": step,
                     "image_tensor": image_tensor[index : index + 1].detach(),
                     "attack_loss": float(attack_losses[index].detach().cpu().item()),
-                    "dino_loss": float(dino_losses[index].detach().cpu().item()),
-                    "semantic_penalty_loss": float(
-                        semantic_penalty_losses[index].detach().cpu().item()
+                    "semantic_loss": float(semantic_losses[index].detach().cpu().item()),
+                    "weighted_semantic_loss": float(
+                        weighted_semantic_losses[index].detach().cpu().item()
                     ),
                     "total_loss": float(total_losses[index].detach().cpu().item()),
                     "adv_pred": eval_result.pred,
                     "adv_top1_conf": eval_result.pred_conf,
                     "adv_true_conf": eval_result.true_conf,
                     "adv_margin": eval_result.margin,
-                    "dino_similarity": semantic_value,
+                    "semantic_similarity": semantic_value,
                     "success": success,
-                    "semantic_constrained_success": semantic_constrained_success,
                 }
                 if success and first_success_step[index] < 0:
                     first_success_step[index] = step
-                if semantic_constrained_success and first_semantic_success_step[index] < 0:
-                    first_semantic_success_step[index] = step
                 if logger is not None:
                     clean_eval = clean_evals[index]
                     logger.log_step(
@@ -1337,18 +1334,20 @@ class LearnableTokenAttackRunner:
                         values={
                             "attack_loss": current["attack_loss"],
                             "attack_objective_loss": current["attack_loss"],
-                            "semantic_loss": current["dino_loss"],
+                            "semantic_loss": current["semantic_loss"],
                             "attack_loss_weight": attack_loss_weight,
-                            "semantic_loss_weight": semantic_loss_weight,
+                            "semantic_loss_weight": _logged_semantic_weight(
+                                self.config,
+                                semantic_loss_weight,
+                            ),
                             "total_loss": current["total_loss"],
                             "lr": current_lr,
                             "true_conf": current["adv_true_conf"],
                             "confidence_drop": clean_eval.true_conf - current["adv_true_conf"],
                             "top1_conf": current["adv_top1_conf"],
                             "logit_gap_true_vs_other": current["adv_margin"],
-                            "dino_similarity": current["dino_similarity"],
+                            "semantic_similarity": current["semantic_similarity"],
                             "success": int(success),
-                            "semantic_constrained_success": int(semantic_constrained_success),
                         },
                     )
                 previous_best = best[index]
@@ -1366,12 +1365,6 @@ class LearnableTokenAttackRunner:
                     or current["adv_true_conf"] < previous_min_true_conf["adv_true_conf"]
                 ):
                     min_true_conf[index] = current
-                previous_semantic_success = best_semantic_success[index]
-                if semantic_constrained_success and (
-                    previous_semantic_success is None
-                    or current["adv_margin"] < previous_semantic_success["adv_margin"]
-                ):
-                    best_semantic_success[index] = current
 
         rows: list[dict[str, Any]] = []
         runtime_seconds = time.perf_counter() - started_at
@@ -1394,9 +1387,6 @@ class LearnableTokenAttackRunner:
             clean_eval = clean_evals[index]
             success = int(best_row["adv_pred"]) != record.class_index
             confidence_drop = clean_eval.true_conf - float(best_row["adv_true_conf"])
-            semantic_constrained_success = (
-                success and float(best_row["dino_similarity"]) >= self.config.attack.semantic_threshold
-            )
             original_one = original_tensor[index : index + 1]
             pixel_metrics = pixel_distance_metrics(original_one, best_row["image_tensor"])
             ssim = global_ssim(original_one, best_row["image_tensor"])
@@ -1405,7 +1395,6 @@ class LearnableTokenAttackRunner:
                 if quality_evaluator is not None
                 else {}
             )
-            semantic_success_step = best_semantic_success[index]
             row = {
                 "stage": self.config.data.split or "data",
                 "training_mode": self.config.attack.training_mode,
@@ -1427,9 +1416,7 @@ class LearnableTokenAttackRunner:
                 "steps": self.config.attack.steps,
                 "lambda_sem": self.config.attack.lambda_sem,
                 "attack_loss_weight": attack_loss_weight,
-                "semantic_loss_weight": semantic_loss_weight,
-                "semantic_threshold": self.config.attack.semantic_threshold,
-                "semantic_penalty_weight": self.config.attack.semantic_penalty_weight,
+                "semantic_loss_weight": _logged_semantic_weight(self.config, semantic_loss_weight),
                 "attack_margin": self.config.attack.attack_margin,
                 "objective": self.config.attack.objective,
                 "attack_batch_size": self.config.attack.batch_size,
@@ -1444,31 +1431,28 @@ class LearnableTokenAttackRunner:
                 "adv_pred_label": victim.categories[int(best_row["adv_pred"])],
                 "adv_top1_conf": float(best_row["adv_top1_conf"]),
                 "success": success,
-                "semantic_constrained_success": semantic_constrained_success,
                 "clean_true_conf": clean_eval.true_conf,
                 "adv_true_conf": float(best_row["adv_true_conf"]),
                 "confidence_drop": confidence_drop,
                 "clean_margin": clean_eval.margin,
                 "adv_margin": float(best_row["adv_margin"]),
                 "margin_drop": clean_eval.margin - float(best_row["adv_margin"]),
-                "dino_similarity": float(best_row["dino_similarity"]),
+                **_semantic_metric_fields(semantic, float(best_row["semantic_similarity"])),
+                "semantic_loss": float(best_row["semantic_loss"]),
+                "weighted_semantic_loss": float(best_row["weighted_semantic_loss"]),
                 "ssim": ssim,
                 **pixel_metrics,
                 **nriqa_metrics,
                 "best_step": int(best_row["step"]),
                 "best_attack_step": int(best_attack_row["step"]),
-                "best_semantic_success_step": (
-                    -1 if semantic_success_step is None else int(semantic_success_step["step"])
-                ),
                 "first_success_step": first_success_step[index],
-                "first_semantic_success_step": first_semantic_success_step[index],
                 "min_adv_true_conf": float(min_true_conf_row["adv_true_conf"]),
                 "min_adv_true_conf_step": int(min_true_conf_row["step"]),
                 "min_adv_margin": float(best_attack_row["adv_margin"]),
                 "min_adv_margin_step": int(best_attack_row["step"]),
                 "best_attack_loss": float(best_row["attack_loss"]),
-                "best_dino_loss": float(best_row["dino_loss"]),
-                "best_semantic_penalty_loss": float(best_row["semantic_penalty_loss"]),
+                "best_semantic_loss": float(best_row["semantic_loss"]),
+                "best_weighted_semantic_loss": float(best_row["weighted_semantic_loss"]),
                 "best_total_loss": float(best_row["total_loss"]),
                 "runtime_seconds": runtime_seconds,
                 "output_image_path": str(output_dir / "adv.png"),

@@ -21,6 +21,7 @@ from prompt_attack.config import (
     NRIQAConfig,
     OutputConfig,
     QualityConfig,
+    SemanticConfig,
     WandbConfig,
     load_config,
     parse_images_per_class,
@@ -53,8 +54,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1.0)
     parser.add_argument("--lambda-sem", type=float, default=0.0)
     parser.add_argument("--attack-margin", type=float, default=0.0)
-    parser.add_argument("--semantic-penalty-weight", type=float, default=10.0)
+    parser.add_argument(
+        "--semantic-loss-weight",
+        "--semantic-penalty-weight",
+        dest="semantic_loss_weight",
+        type=float,
+        default=10.0,
+        help="Weight for continuous image-to-image semantic loss. "
+        "--semantic-penalty-weight is kept as a deprecated alias.",
+    )
     parser.add_argument("--objective", default="cr")
+    parser.add_argument(
+        "--semantic-model",
+        help="Semantic image encoder. Defaults to CLIP for margin_clip_img2img, DINO otherwise.",
+    )
     parser.add_argument("--learnable-token-initializer", default="object")
     parser.add_argument("--learnable-token-init-seed", type=int, default=0)
     parser.add_argument("--height", type=int, default=512)
@@ -119,13 +132,21 @@ def run_name(args: argparse.Namespace, *, train_ipc: int | None, test_ipc: int |
     test_label = images_per_class_label(test_ipc)
     objective_label = args.objective.lower().replace("-", "_")
     lambda_label = f"{args.lambda_sem:g}".replace(".", "p")
+    semantic_weight_label = f"{args.semantic_loss_weight:g}".replace(".", "p")
     initializer_label = args.learnable_token_initializer.lower().replace("-", "_").replace(" ", "_")
     return (
         f"uap_fixed10_train{train_label}_test{test_label}_"
         f"gb{global_batch_size(args)}_gbs{args.generator_batch_size}_"
         f"epochs{args.epochs}_nis{args.num_inference_steps}_tokens{args.num_tokens}_"
-        f"{objective_label}_init{initializer_label}_lam{lambda_label}"
+        f"{objective_label}_init{initializer_label}_lam{lambda_label}_semw{semantic_weight_label}"
     )
+
+
+def inferred_semantic_model(objective: str, fallback: str) -> str:
+    normalized = objective.lower().replace("-", "_")
+    if "clip" in normalized:
+        return "clip_vit_b32"
+    return fallback
 
 
 def configured_generator(base: GeneratorConfig, args: argparse.Namespace) -> GeneratorConfig:
@@ -166,6 +187,7 @@ def build_stage_config(
     base = load_config(args.config)
     wandb = base.logging.wandb
     imagenet_root = args.imagenet_root or base.data.imagenet_root
+    semantic_name = args.semantic_model or inferred_semantic_model(args.objective, base.semantic.name)
     return replace(
         base,
         data=DataConfig(
@@ -175,6 +197,10 @@ def build_stage_config(
             images_per_class=images_per_class,
             clean_correct_only=not args.include_clean_incorrect,
             candidate_multiplier=base.data.candidate_multiplier,
+        ),
+        semantic=SemanticConfig(
+            name=semantic_name,
+            feature=base.semantic.feature,
         ),
         generator=configured_generator(base.generator, args),
         attack=replace(
@@ -187,7 +213,7 @@ def build_stage_config(
             lr=args.lr,
             steps=steps,
             lambda_sem=args.lambda_sem,
-            semantic_penalty_weight=args.semantic_penalty_weight,
+            semantic_loss_weight=args.semantic_loss_weight,
             attack_margin=args.attack_margin,
             objective=args.objective,
         ),
@@ -261,7 +287,8 @@ def print_run_overview(
         ("initializer", args.learnable_token_initializer),
         ("init seed", args.learnable_token_init_seed),
         ("attack margin", args.attack_margin),
-        ("semantic penalty weight", args.semantic_penalty_weight),
+        ("semantic model", args.semantic_model or inferred_semantic_model(args.objective, "dinov2_vitb14")),
+        ("semantic loss weight", args.semantic_loss_weight),
         ("train updates", steps),
         ("global batch", global_batch_size(args)),
         ("generator batch", args.generator_batch_size),
@@ -502,10 +529,11 @@ def main() -> None:
                 "global_batch_size": global_batch_size(args),
                 "generator_batch_size": args.generator_batch_size,
                 "objective": args.objective,
+                "semantic_model": train_config.semantic.name,
                 "learnable_token_initializer": args.learnable_token_initializer,
                 "learnable_token_init_seed": args.learnable_token_init_seed,
                 "attack_margin": args.attack_margin,
-                "semantic_penalty_weight": args.semantic_penalty_weight,
+                "semantic_loss_weight": args.semantic_loss_weight,
                 "save_train_images": args.save_train_images,
                 "train": train_summary,
                 "test": test_summary,
@@ -529,11 +557,12 @@ def main() -> None:
                     "num_inference_steps": args.num_inference_steps,
                     "num_learnable_tokens": args.num_tokens,
                     "objective": args.objective,
+                    "semantic_model": train_config.semantic.name,
                     "lambda_sem": args.lambda_sem,
                     "learnable_token_initializer": args.learnable_token_initializer,
                     "learnable_token_init_seed": args.learnable_token_init_seed,
                     "attack_margin": args.attack_margin,
-                    "semantic_penalty_weight": args.semantic_penalty_weight,
+                    "semantic_loss_weight": args.semantic_loss_weight,
                     "lr": args.lr,
                     "output_root": str(output_root),
                 },
@@ -543,7 +572,13 @@ def main() -> None:
                     {
                         "test_asr": test_summary["asr"],
                         "test_clean_correct_asr": test_summary["clean_correct"]["asr"],
+                        "test_mean_semantic_similarity": test_summary[
+                            "mean_semantic_similarity"
+                        ],
                         "test_mean_dino_similarity": test_summary["mean_dino_similarity"],
+                        "test_mean_clip_image_similarity": test_summary[
+                            "mean_clip_image_similarity"
+                        ],
                         "train_updates": len(history),
                         "elapsed_seconds": elapsed,
                     }

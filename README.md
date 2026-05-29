@@ -56,6 +56,8 @@ Use these objective names in `attack.objective`:
 | --- | --- | --- |
 | `cr` | Classification rejection only | Uses only CR; DINO is logged as a metric but not optimized. |
 | `cr_dino` | Classification rejection with DINO preservation | Uses `(1 - lambda_sem) * CR + lambda_sem * DINO_loss`. |
+| `margin_dino` | Bounded margin attack with DINO image-to-image preservation | Uses margin hinge plus `semantic_loss_weight * (1 - DINO_image_similarity)`. |
+| `margin_clip_img2img` | Bounded margin attack with CLIP image-to-image preservation | Uses margin hinge plus `semantic_loss_weight * (1 - CLIP_image_similarity)`. |
 | `negative_cross_entropy` | Legacy alias for CR-style untargeted attack | Still supported for compatibility. |
 | `untargeted_margin` | Legacy margin objective | Minimizes true logit minus best other logit. |
 
@@ -82,6 +84,17 @@ For `cr_dino`, the effective weights are:
 attack_loss_weight = 1.0 - lambda_sem
 semantic_loss_weight = lambda_sem
 ```
+
+For the margin image-to-image objectives, the attack term is bounded:
+
+```text
+margin_attack = relu(true_logit - max_other_logit + attack_margin)
+semantic_loss = 1 - image_similarity(original, adv)
+total_loss = margin_attack + semantic_loss_weight * semantic_loss
+```
+
+This removes the previous hard `semantic_threshold` cutoff. Semantic quality is reported as
+continuous DINO/CLIP-I/SSIM metrics instead of a binary semantic success metric.
 
 ## Repository Map
 
@@ -114,7 +127,7 @@ src/prompt_attack/
   generators/flux2.py          FLUX.2 textual-inversion-token adapter.
   generators/mock.py           Differentiable mock generator for tests.
   metrics/                     FID, IQA, image distance, summary metrics.
-  models/                      Victim classifier and DINOv2 semantic model.
+  models/                      Victim classifier and DINOv2/CLIP semantic models.
   utils/wandb_logger.py        W&B scalar/image/table logging.
 
 tests/
@@ -278,17 +291,18 @@ lambda_sem
 attack_loss_weight
 semantic_loss_weight
 success
-semantic_constrained_success
 clean_true_conf
 adv_true_conf
 confidence_drop
+semantic_model
+semantic_metric
+semantic_similarity
 dino_similarity
+clip_image_similarity
 ssim
 best_step
 best_attack_step
-best_semantic_success_step
 first_success_step
-first_semantic_success_step
 runtime_seconds
 ```
 
@@ -331,7 +345,7 @@ attack:
     min_lr: 1.0e-4
   steps: 100
   lambda_sem: 0.0
-  semantic_threshold: 0.85
+  semantic_loss_weight: 10.0
   objective: cr
 ```
 
@@ -366,8 +380,8 @@ Important interpretation:
 - `lambda_sem` behavior has not been monotonic. One likely reason is that the learnable token
   initialization is not yet seeded, so different lambda runs may start from different prompt
   embeddings.
-- The current final image is selected by minimum total loss. If a semantic-constrained success
-  happened at an earlier step, the saved final image may still be a later non-semantic candidate.
+- The current final image is selected by minimum total loss. For margin image-to-image objectives,
+  total loss includes continuous semantic preservation instead of a thresholded semantic success.
 
 ## Known Limitations
 
@@ -376,8 +390,8 @@ Important interpretation:
    per image/config. This makes lambda/token-count comparisons noisy.
 
 2. Final selection is coupled to the optimization loss.
-   The runner tracks `best_semantic_success_step`, but the saved image is still chosen by `best`
-   total loss. This can under-report useful semantic-constrained candidates.
+   The saved image is chosen by lowest total loss. If a run needs a different trade-off, add a
+   separate selector over ASR, DINO/CLIP-I, and SSIM.
 
 3. CR and DINO losses have different scales.
    CR is negative CE and can have a much larger magnitude than `1 - DINO_similarity`. Even with

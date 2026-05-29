@@ -26,7 +26,7 @@ def test_load_config() -> None:
     assert config.attack.lr_scheduler.min_lr == 1.0e-4
     assert config.attack.steps == 100
     assert config.attack.lambda_sem == 0.0
-    assert config.attack.semantic_penalty_weight == 10.0
+    assert config.attack.semantic_loss_weight == 10.0
     assert config.attack.attack_margin == 0.0
     assert config.attack.objective == "cr"
     assert config.quality.fid.enabled
@@ -62,7 +62,7 @@ def test_smoke_override_uses_mock() -> None:
     assert smoke.attack.learnable_token_initializer == config.attack.learnable_token_initializer
     assert smoke.attack.learnable_token_init_std == config.attack.learnable_token_init_std
     assert smoke.attack.learnable_token_init_seed == config.attack.learnable_token_init_seed
-    assert smoke.attack.semantic_penalty_weight == config.attack.semantic_penalty_weight
+    assert smoke.attack.semantic_loss_weight == config.attack.semantic_loss_weight
     assert smoke.attack.attack_margin == config.attack.attack_margin
     assert smoke.attack.lr_scheduler.name == "cosine"
     assert not smoke.quality.fid.enabled

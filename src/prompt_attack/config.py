@@ -77,6 +77,13 @@ class OutputConfig:
     root: Path = Path("outputs/flux2_klein_4b")
     save_grids: bool = True
     save_images: bool = True
+    save_original_images: bool = False
+    save_adv_images: bool = True
+    grid_save_policy: str = "representative"
+    max_saved_grids: int = 48
+    image_format: str = "jpg"
+    image_quality: int = 95
+    image_save_workers: int = 4
 
 
 @dataclass(frozen=True)
@@ -202,6 +209,12 @@ def load_config(path: Path) -> ExperimentConfig:
         )
     else:
         nriqa_metrics = tuple(str(metric) for metric in nriqa_metrics_raw)
+    grid_save_policy = str(output_raw.get("grid_save_policy", "representative")).lower()
+    if grid_save_policy not in {"representative", "all", "none"}:
+        raise ValueError("Config field 'output.grid_save_policy' must be representative, all, or none.")
+    image_format = str(output_raw.get("image_format", "jpg")).lower()
+    if image_format not in {"png", "jpg", "jpeg", "webp"}:
+        raise ValueError("Config field 'output.image_format' must be png, jpg, jpeg, or webp.")
 
     split_raw = data_raw.get("split", "val")
     imagenet_root_raw = os.environ.get("PROMPT_ATTACK_IMAGENET_ROOT", data_raw["imagenet_root"])
@@ -282,15 +295,20 @@ def load_config(path: Path) -> ExperimentConfig:
             root=Path(str(output_raw.get("root", "outputs/flux2_klein_4b"))),
             save_grids=bool(output_raw.get("save_grids", True)),
             save_images=bool(output_raw.get("save_images", True)),
+            save_original_images=bool(output_raw.get("save_original_images", False)),
+            save_adv_images=bool(output_raw.get("save_adv_images", True)),
+            grid_save_policy=grid_save_policy,
+            max_saved_grids=max(0, int(output_raw.get("max_saved_grids", 48))),
+            image_format=image_format,
+            image_quality=max(1, min(100, int(output_raw.get("image_quality", 95)))),
+            image_save_workers=max(1, int(output_raw.get("image_save_workers", 4))),
         ),
         logging=LoggingConfig(
             wandb=WandbConfig(
                 enabled=bool(wandb_raw.get("enabled", False)),
                 project=str(wandb_raw.get("project", "prompt-attack")),
                 entity=(
-                    None
-                    if wandb_raw.get("entity") in {None, ""}
-                    else str(wandb_raw.get("entity"))
+                    None if wandb_raw.get("entity") in {None, ""} else str(wandb_raw.get("entity"))
                 ),
                 name=None if wandb_raw.get("name") in {None, ""} else str(wandb_raw.get("name")),
                 mode=str(wandb_raw.get("mode", "offline")),
@@ -366,6 +384,13 @@ def with_smoke_overrides(config: ExperimentConfig, *, use_mock_generator: bool) 
             root=config.output.root / "smoke",
             save_grids=config.output.save_grids,
             save_images=config.output.save_images,
+            save_original_images=config.output.save_original_images,
+            save_adv_images=config.output.save_adv_images,
+            grid_save_policy=config.output.grid_save_policy,
+            max_saved_grids=config.output.max_saved_grids,
+            image_format=config.output.image_format,
+            image_quality=config.output.image_quality,
+            image_save_workers=config.output.image_save_workers,
         ),
         logging=LoggingConfig(
             wandb=WandbConfig(
@@ -373,9 +398,7 @@ def with_smoke_overrides(config: ExperimentConfig, *, use_mock_generator: bool) 
                 project=config.logging.wandb.project,
                 entity=config.logging.wandb.entity,
                 name=(
-                    f"{config.logging.wandb.name}-smoke"
-                    if config.logging.wandb.name
-                    else "smoke"
+                    f"{config.logging.wandb.name}-smoke" if config.logging.wandb.name else "smoke"
                 ),
                 mode=config.logging.wandb.mode,
                 dir=config.logging.wandb.dir,

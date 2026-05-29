@@ -81,7 +81,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     parser.add_argument("--wandb-project", default="prompt-learnable-token-attack")
-    parser.add_argument("--log-images", action="store_true")
+    parser.add_argument(
+        "--log-images",
+        action="store_true",
+        help="Upload per-image media to W&B. Keep disabled for full runs; scalar metrics still log.",
+    )
+    parser.add_argument(
+        "--save-original-images",
+        action="store_true",
+        help="Also copy original images into the output tree. Default keeps source paths only.",
+    )
+    parser.add_argument("--image-format", default="jpg", choices=("png", "jpg", "jpeg", "webp"))
+    parser.add_argument("--image-quality", type=int, default=95)
+    parser.add_argument("--image-save-workers", type=int, default=4)
+    parser.add_argument(
+        "--grid-save-policy",
+        default="representative",
+        choices=("representative", "all", "none"),
+        help="Save qualitative grids for representative rows, every row, or no rows.",
+    )
+    parser.add_argument("--max-saved-grids", type=int, default=48)
     return parser.parse_args()
 
 
@@ -90,7 +109,9 @@ def images_per_class_label(value: int | None) -> str:
 
 
 def global_batch_size(args: argparse.Namespace) -> int:
-    batch_size = args.global_batch_size if args.global_batch_size is not None else args.attack_batch_size
+    batch_size = (
+        args.global_batch_size if args.global_batch_size is not None else args.attack_batch_size
+    )
     if batch_size is None:
         batch_size = 2
     return max(1, int(batch_size))
@@ -187,7 +208,9 @@ def build_stage_config(
     base = load_config(args.config)
     wandb = base.logging.wandb
     imagenet_root = args.imagenet_root or base.data.imagenet_root
-    semantic_name = args.semantic_model or inferred_semantic_model(args.objective, base.semantic.name)
+    semantic_name = args.semantic_model or inferred_semantic_model(
+        args.objective, base.semantic.name
+    )
     return replace(
         base,
         data=DataConfig(
@@ -217,7 +240,18 @@ def build_stage_config(
             attack_margin=args.attack_margin,
             objective=args.objective,
         ),
-        output=OutputConfig(root=output_root, save_grids=True, save_images=True),
+        output=OutputConfig(
+            root=output_root,
+            save_grids=args.grid_save_policy != "none",
+            save_images=True,
+            save_original_images=args.save_original_images,
+            save_adv_images=True,
+            grid_save_policy=args.grid_save_policy,
+            max_saved_grids=max(0, args.max_saved_grids),
+            image_format=args.image_format,
+            image_quality=max(1, min(100, args.image_quality)),
+            image_save_workers=max(1, args.image_save_workers),
+        ),
         quality=QualityConfig(
             fid=FIDConfig(enabled=False, fid_root=base.quality.fid.fid_root),
             nriqa=NRIQAConfig(enabled=False, metrics=base.quality.nriqa.metrics),
@@ -287,7 +321,10 @@ def print_run_overview(
         ("initializer", args.learnable_token_initializer),
         ("init seed", args.learnable_token_init_seed),
         ("attack margin", args.attack_margin),
-        ("semantic model", args.semantic_model or inferred_semantic_model(args.objective, "dinov2_vitb14")),
+        (
+            "semantic model",
+            args.semantic_model or inferred_semantic_model(args.objective, "dinov2_vitb14"),
+        ),
         ("semantic loss weight", args.semantic_loss_weight),
         ("train updates", steps),
         ("global batch", global_batch_size(args)),
@@ -296,11 +333,19 @@ def print_run_overview(
         ("test eval batches", batch_count(test_records, args.generator_batch_size)),
         (
             "train eval batches",
-            batch_count(train_records, args.generator_batch_size) if args.save_train_images else "skipped",
+            batch_count(train_records, args.generator_batch_size)
+            if args.save_train_images
+            else "skipped",
         ),
         ("world size", dist_context.world_size),
         ("device", dist_context.device),
         ("wandb mode", args.wandb_mode),
+        ("wandb image upload", args.log_images),
+        ("save originals", args.save_original_images),
+        ("image format", args.image_format),
+        ("grid policy", args.grid_save_policy),
+        ("max saved grids", args.max_saved_grids),
+        ("image save workers", args.image_save_workers),
         ("stage count", stages),
         ("history csv", metrics_dir / "train_history.csv"),
         ("test csv", metrics_dir / "test_results.csv"),
@@ -501,18 +546,30 @@ def main() -> None:
             if dist_context.is_distributed:
                 if args.save_train_images:
                     train_rows = merge_csv_files(
-                        [metrics_dir / f"train_results_rank{rank}.csv" for rank in range(dist_context.world_size)],
+                        [
+                            metrics_dir / f"train_results_rank{rank}.csv"
+                            for rank in range(dist_context.world_size)
+                        ],
                         metrics_dir / "train_results.csv",
                     )
                 test_rows = merge_csv_files(
-                    [metrics_dir / f"test_results_rank{rank}.csv" for rank in range(dist_context.world_size)],
+                    [
+                        metrics_dir / f"test_results_rank{rank}.csv"
+                        for rank in range(dist_context.world_size)
+                    ],
                     metrics_dir / "test_results.csv",
                 )
             else:
-                train_rows = read_csv_rows(metrics_dir / "train_results.csv") if args.save_train_images else []
+                train_rows = (
+                    read_csv_rows(metrics_dir / "train_results.csv")
+                    if args.save_train_images
+                    else []
+                )
                 test_rows = read_csv_rows(metrics_dir / "test_results.csv")
 
-            train_fid = compute_fid_for_rows(train_rows, train_config.quality.fid) if train_rows else None
+            train_fid = (
+                compute_fid_for_rows(train_rows, train_config.quality.fid) if train_rows else None
+            )
             test_fid = compute_fid_for_rows(test_rows, test_config.quality.fid)
             train_summary = stage_summary(train_rows, fid=train_fid) if train_rows else None
             test_summary = stage_summary(test_rows, fid=test_fid)
@@ -535,6 +592,10 @@ def main() -> None:
                 "attack_margin": args.attack_margin,
                 "semantic_loss_weight": args.semantic_loss_weight,
                 "save_train_images": args.save_train_images,
+                "save_original_images": args.save_original_images,
+                "image_format": args.image_format,
+                "grid_save_policy": args.grid_save_policy,
+                "max_saved_grids": args.max_saved_grids,
                 "train": train_summary,
                 "test": test_summary,
                 "final_train_history": history[-1] if history else None,
@@ -565,6 +626,10 @@ def main() -> None:
                     "semantic_loss_weight": args.semantic_loss_weight,
                     "lr": args.lr,
                     "output_root": str(output_root),
+                    "save_original_images": args.save_original_images,
+                    "image_format": args.image_format,
+                    "grid_save_policy": args.grid_save_policy,
+                    "max_saved_grids": args.max_saved_grids,
                 },
             )
             if logger is not None:
@@ -572,9 +637,7 @@ def main() -> None:
                     {
                         "test_asr": test_summary["asr"],
                         "test_clean_correct_asr": test_summary["clean_correct"]["asr"],
-                        "test_mean_semantic_similarity": test_summary[
-                            "mean_semantic_similarity"
-                        ],
+                        "test_mean_semantic_similarity": test_summary["mean_semantic_similarity"],
                         "test_mean_dino_similarity": test_summary["mean_dino_similarity"],
                         "test_mean_clip_image_similarity": test_summary[
                             "mean_clip_image_similarity"

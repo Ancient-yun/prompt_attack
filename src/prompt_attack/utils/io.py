@@ -26,6 +26,18 @@ def append_csv_row(path: Path, row: dict[str, Any]) -> None:
         writer.writerow(row)
 
 
+def write_csv_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Rewrite a CSV file from a list of rows."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def write_json(path: Path, value: Any) -> None:
     """Write JSON with dataclass support."""
     path.parent.mkdir(parents=True, exist_ok=True)

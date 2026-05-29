@@ -54,8 +54,7 @@ class WandbLogger:
         mode_raw = os.environ.get("WANDB_MODE") or wandb_config.mode
         if mode_raw not in {"online", "offline", "disabled", "shared"}:
             raise ValueError(
-                "logging.wandb.mode or WANDB_MODE must be one of "
-                "online, offline, disabled, shared."
+                "logging.wandb.mode or WANDB_MODE must be one of online, offline, disabled, shared."
             )
         mode = cast(WandbMode, mode_raw)
         project = os.environ.get("WANDB_PROJECT") or wandb_config.project
@@ -249,36 +248,45 @@ class WandbLogger:
                 table_adversarial,
             ]
         )
-        if self._wandb is not None:
-            payload["image_results/table"] = self._wandb.Table(
-                columns=[
-                    "image_id",
-                    "true_label",
-                    "clean_pred",
-                    "adv_pred",
-                    "success",
-                    "clean_true_conf",
-                    "adv_true_conf",
-                    "confidence_drop",
-                    "logit_gap_drop",
-                    "semantic_similarity",
-                    "dino_similarity",
-                    "clip_image_similarity",
-                    "ssim",
-                    "NIMA-AVA",
-                    "HyperIQA",
-                    "MUSIQ-AVA",
-                    "MUSIQ-KonIQ",
-                    "TReS",
-                    "best_step",
-                    "first_success_step",
-                    "runtime_seconds",
-                    "original",
-                    "adversarial",
-                ],
-                data=self._image_result_rows,
-            )
         self._run.log(payload, step=self._global_step)
+
+    def flush_image_table(self) -> None:
+        """Upload the accumulated image result table once at the end of a run."""
+        if self._run is None or self._wandb is None or not self._image_result_rows:
+            return
+        self._run.log(
+            {
+                "image_results/table": self._wandb.Table(
+                    columns=[
+                        "image_id",
+                        "true_label",
+                        "clean_pred",
+                        "adv_pred",
+                        "success",
+                        "clean_true_conf",
+                        "adv_true_conf",
+                        "confidence_drop",
+                        "logit_gap_drop",
+                        "semantic_similarity",
+                        "dino_similarity",
+                        "clip_image_similarity",
+                        "ssim",
+                        "NIMA-AVA",
+                        "HyperIQA",
+                        "MUSIQ-AVA",
+                        "MUSIQ-KonIQ",
+                        "TReS",
+                        "best_step",
+                        "first_success_step",
+                        "runtime_seconds",
+                        "original",
+                        "adversarial",
+                    ],
+                    data=self._image_result_rows,
+                )
+            },
+            step=self._global_step,
+        )
 
     def log_summary(self, summary: dict[str, Any]) -> None:
         if self._run is None:
@@ -291,6 +299,7 @@ class WandbLogger:
 
     def finish(self) -> None:
         if self._run is not None:
+            self.flush_image_table()
             self._run.finish()
         self._run = None
         self._wandb = None

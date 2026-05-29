@@ -31,8 +31,14 @@ from prompt_attack.metrics.summary import summarize_rows
 from prompt_attack.models.semantic import build_semantic_model
 from prompt_attack.models.victim import build_victim
 from prompt_attack.utils.distributed import DistributedContext
-from prompt_attack.utils.image import make_side_by_side, pil_to_tensor, save_image, tensor_to_pil
-from prompt_attack.utils.io import append_csv_row, ensure_dir, write_json
+from prompt_attack.utils.image import (
+    AsyncImageWriter,
+    image_extension,
+    make_side_by_side,
+    pil_to_tensor,
+    tensor_to_pil,
+)
+from prompt_attack.utils.io import append_csv_row, ensure_dir, write_csv_rows, write_json
 from prompt_attack.utils.process_title import set_process_title
 from prompt_attack.utils.seed import stable_image_seed
 from prompt_attack.utils.wandb_logger import WandbLogger
@@ -113,6 +119,113 @@ class LearnableTokenAttackRunner:
     def __init__(self, config: ExperimentConfig, *, device: str) -> None:
         self.config = config
         self.device = device
+
+    def _image_writer(self) -> AsyncImageWriter:
+        """Create a background writer using the configured output policy."""
+        return AsyncImageWriter(
+            max_workers=self.config.output.image_save_workers,
+            image_format=self.config.output.image_format,
+            quality=self.config.output.image_quality,
+        )
+
+    def _image_file_path(self, output_dir: Path, stem: str) -> Path:
+        return output_dir / f"{stem}{image_extension(self.config.output.image_format)}"
+
+    def _grid_file_path(self, *, stage: str, class_label: str, image_id: str) -> Path:
+        return (
+            self.config.output.root
+            / "grids"
+            / f"{stage}_{class_label}_{image_id}{image_extension(self.config.output.image_format)}"
+        )
+
+    def _save_eval_images(
+        self,
+        *,
+        writer: AsyncImageWriter,
+        original: Any,
+        adversarial: Any,
+        output_dir: Path,
+    ) -> tuple[Path, Path]:
+        """Queue configured original/adv image writes and return their row paths."""
+        original_path = self._image_file_path(output_dir, "original")
+        adv_path = self._image_file_path(output_dir, "adv")
+        if self.config.output.save_images and self.config.output.save_original_images:
+            writer.save(original, original_path)
+        if self.config.output.save_images and self.config.output.save_adv_images:
+            writer.save(adversarial, adv_path)
+        return original_path, adv_path
+
+    def _save_grid_if_all_policy(
+        self,
+        *,
+        writer: AsyncImageWriter,
+        original: Any,
+        adversarial: Any,
+        grid_path: Path,
+    ) -> bool:
+        if not self.config.output.save_grids:
+            return False
+        policy = self.config.output.grid_save_policy.lower()
+        if policy != "all":
+            return False
+        grid = make_side_by_side(original, adversarial, "original", "adv")
+        writer.save(grid, grid_path)
+        return True
+
+    def _representative_grid_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Pick a compact mix of successes, semantic drifts, and failures for grids."""
+        if not self.config.output.save_grids:
+            return []
+        if self.config.output.grid_save_policy.lower() != "representative":
+            return []
+        limit = self.config.output.max_saved_grids
+        if limit <= 0:
+            return []
+
+        def is_success(row: dict[str, Any]) -> bool:
+            return str(row.get("success", "")).lower() in {"1", "true", "yes", "y"}
+
+        def semantic(row: dict[str, Any]) -> float:
+            return float(row.get("semantic_similarity", 0.0))
+
+        successes = [row for row in rows if is_success(row)]
+        failures = [row for row in rows if not is_success(row)]
+        buckets = [
+            sorted(successes, key=semantic, reverse=True),
+            sorted(successes, key=semantic),
+            sorted(failures, key=semantic, reverse=True),
+        ]
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        while len(selected) < limit and any(buckets):
+            for bucket in buckets:
+                while bucket:
+                    row = bucket.pop(0)
+                    key = f"{row.get('stage')}::{row.get('class_label')}::{row.get('image_id')}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    selected.append(row)
+                    break
+                if len(selected) >= limit:
+                    break
+        return selected
+
+    def _save_representative_grids(self, rows: list[dict[str, Any]]) -> None:
+        selected = self._representative_grid_rows(rows)
+        if not selected:
+            return
+        with self._image_writer() as writer:
+            for row in selected:
+                original_path = Path(str(row["original_image_path"]))
+                adv_path = Path(str(row["output_image_path"]))
+                if not original_path.exists() or not adv_path.exists():
+                    continue
+                original = load_image(original_path)
+                adversarial = load_image(adv_path)
+                grid = make_side_by_side(original, adversarial, "original", "adv")
+                writer.save(grid, Path(str(row["grid_image_path"])))
+                row["grid_saved"] = True
 
     def build_components(self) -> AttackComponents:
         """Load reusable attack models and evaluators."""
@@ -235,8 +348,7 @@ class LearnableTokenAttackRunner:
                 results = victim.evaluate_pil_batch(images, labels)
             else:
                 results = [
-                    victim.evaluate_pil(image, label)
-                    for image, label in zip(images, labels)
+                    victim.evaluate_pil(image, label) for image, label in zip(images, labels)
                 ]
             for record, result in zip(batch, results):
                 key = record_key(record)
@@ -352,7 +464,8 @@ class LearnableTokenAttackRunner:
         """Build per-class prompt texts backed by one shared learnable token tensor."""
         return LearnablePromptBatch(
             prompt_texts=tuple(
-                build_prompt(record.class_label, len(prompt_state.token_texts)) for record in records
+                build_prompt(record.class_label, len(prompt_state.token_texts))
+                for record in records
             ),
             token_texts=prompt_state.token_texts,
             token_ids=prompt_state.token_ids,
@@ -555,7 +668,7 @@ class LearnableTokenAttackRunner:
                     eval_results = components.victim.evaluate_logits_batch(
                         logits.detach(),
                         true_labels.detach().cpu().tolist(),
-                )
+                    )
                 step_attack_loss += float(attack_losses.detach().sum().cpu().item())
                 step_semantic_loss += float(semantic_losses.detach().sum().cpu().item())
                 step_weighted_semantic_loss += float(
@@ -597,8 +710,7 @@ class LearnableTokenAttackRunner:
                 "lr": current_lr,
                 "attack_loss": float(stats[0].detach().cpu().item()) / global_processed,
                 "semantic_loss": float(stats[1].detach().cpu().item()) / global_processed,
-                "weighted_semantic_loss": float(stats[2].detach().cpu().item())
-                / global_processed,
+                "weighted_semantic_loss": float(stats[2].detach().cpu().item()) / global_processed,
                 "total_loss": float(stats[3].detach().cpu().item()) / global_processed,
                 "success_rate": float(stats[4].detach().cpu().item()) / global_processed,
                 "effective_batch_size": len(batch),
@@ -690,203 +802,231 @@ class LearnableTokenAttackRunner:
             disable=not show_progress,
             dynamic_ncols=True,
         )
-        for batch_index, batch in enumerate(progress):
-            started_at = time.perf_counter()
-            images, original_tensor, true_labels = self._load_batch_inputs(batch)
-            prompt_batch = self._shared_prompt_batch(prompt_state, batch)
-            seeds = [stable_image_seed(0, record.image_id) for record in batch]
-            generated = components.generator.generate_batch(
-                input_images=images,
-                input_tensor=original_tensor,
-                prompt_state=prompt_batch,
-                seeds=seeds,
-                require_grad=False,
-            )
-            image_tensor = generated.image_tensor
-            if not isinstance(image_tensor, torch.Tensor):
-                raise TypeError("Generator batch result must expose torch.Tensor image_tensor.")
-            with torch.no_grad():
-                clean_logits = components.victim.logits_from_tensor(original_tensor)
-                adv_logits = components.victim.logits_from_tensor(image_tensor)
-                clean_evals = components.victim.evaluate_logits_batch(
-                    clean_logits,
-                    true_labels.detach().cpu().tolist(),
+        with self._image_writer() as image_writer:
+            for batch_index, batch in enumerate(progress):
+                started_at = time.perf_counter()
+                images, original_tensor, true_labels = self._load_batch_inputs(batch)
+                prompt_batch = self._shared_prompt_batch(prompt_state, batch)
+                seeds = [stable_image_seed(0, record.image_id) for record in batch]
+                generated = components.generator.generate_batch(
+                    input_images=images,
+                    input_tensor=original_tensor,
+                    prompt_state=prompt_batch,
+                    seeds=seeds,
+                    require_grad=False,
                 )
-                adv_evals = components.victim.evaluate_logits_batch(
-                    adv_logits,
-                    true_labels.detach().cpu().tolist(),
-                )
-                semantic_sim = components.semantic.similarity(original_tensor, image_tensor)
-                dino_metric_sim = (
-                    components.dino_metric.similarity(original_tensor, image_tensor)
-                    if components.dino_metric is not None
-                    else None
-                )
-                attack_losses, semantic_losses, weighted_semantic_losses, total_losses = (
-                    objective_loss_components(
-                        adv_logits,
-                        true_labels,
-                        self.config.attack.objective,
-                        semantic_similarity=semantic_sim,
-                        lambda_sem=self.config.attack.lambda_sem,
-                        semantic_loss_weight=self.config.attack.semantic_loss_weight,
-                        attack_margin=self.config.attack.attack_margin,
+                image_tensor = generated.image_tensor
+                if not isinstance(image_tensor, torch.Tensor):
+                    raise TypeError("Generator batch result must expose torch.Tensor image_tensor.")
+                with torch.no_grad():
+                    clean_logits = components.victim.logits_from_tensor(original_tensor)
+                    adv_logits = components.victim.logits_from_tensor(image_tensor)
+                    clean_evals = components.victim.evaluate_logits_batch(
+                        clean_logits,
+                        true_labels.detach().cpu().tolist(),
                     )
-                )
+                    adv_evals = components.victim.evaluate_logits_batch(
+                        adv_logits,
+                        true_labels.detach().cpu().tolist(),
+                    )
+                    semantic_sim = components.semantic.similarity(original_tensor, image_tensor)
+                    dino_metric_sim = (
+                        components.dino_metric.similarity(original_tensor, image_tensor)
+                        if components.dino_metric is not None
+                        else None
+                    )
+                    attack_losses, semantic_losses, weighted_semantic_losses, total_losses = (
+                        objective_loss_components(
+                            adv_logits,
+                            true_labels,
+                            self.config.attack.objective,
+                            semantic_similarity=semantic_sim,
+                            lambda_sem=self.config.attack.lambda_sem,
+                            semantic_loss_weight=self.config.attack.semantic_loss_weight,
+                            attack_margin=self.config.attack.attack_margin,
+                        )
+                    )
 
-            runtime_seconds = time.perf_counter() - started_at
-            for index, record in enumerate(batch):
-                clean_eval = clean_evals[index]
-                adv_eval = adv_evals[index]
-                adv_image = tensor_to_pil(image_tensor[index : index + 1])
-                output_dir = self.config.output.root / "images" / stage / record.class_label / record.image_id
-                if self.config.output.save_images:
-                    save_image(images[index], output_dir / "original.png")
-                    save_image(adv_image, output_dir / "adv.png")
-                grid_path = (
-                    self.config.output.root
-                    / "grids"
-                    / f"{stage}_{record.class_label}_{record.image_id}.png"
-                )
-                if self.config.output.save_grids:
-                    grid = make_side_by_side(images[index], adv_image, "original", "adv")
-                    save_image(grid, grid_path)
+                runtime_seconds = time.perf_counter() - started_at
+                for index, record in enumerate(batch):
+                    clean_eval = clean_evals[index]
+                    adv_eval = adv_evals[index]
+                    adv_image = tensor_to_pil(image_tensor[index : index + 1])
+                    output_dir = (
+                        self.config.output.root
+                        / "images"
+                        / stage
+                        / record.class_label
+                        / record.image_id
+                    )
+                    original_output_path, adv_output_path = self._save_eval_images(
+                        writer=image_writer,
+                        original=images[index],
+                        adversarial=adv_image,
+                        output_dir=output_dir,
+                    )
+                    original_row_path = (
+                        original_output_path
+                        if self.config.output.save_images
+                        and self.config.output.save_original_images
+                        else record.path
+                    )
+                    grid_path = self._grid_file_path(
+                        stage=stage,
+                        class_label=record.class_label,
+                        image_id=record.image_id,
+                    )
+                    grid_saved = self._save_grid_if_all_policy(
+                        writer=image_writer,
+                        original=images[index],
+                        adversarial=adv_image,
+                        grid_path=grid_path,
+                    )
 
-                original_one = original_tensor[index : index + 1]
-                adv_one = image_tensor[index : index + 1]
-                success = adv_eval.pred != record.class_index
-                clean_correct = clean_eval.pred == record.class_index
-                semantic_value = float(semantic_sim[index].detach().cpu().item())
-                dino_metric_value = (
-                    float(dino_metric_sim[index].detach().cpu().item())
-                    if dino_metric_sim is not None
-                    else None
-                )
-                pixel_metrics = pixel_distance_metrics(original_one, adv_one)
-                ssim = global_ssim(original_one, adv_one)
-                nriqa_metrics = (
-                    components.quality_evaluator.score_tensor(adv_one)
-                    if components.quality_evaluator is not None
-                    else {}
-                )
-                final_step = self.config.attack.steps
-                row = {
-                    "stage": stage,
-                    "training_mode": "universal",
-                    "image_id": record.image_id,
-                    "class_id": record.class_index,
-                    "class_label": record.class_label,
-                    "run_name": self.config.generator.name,
-                    "seed": seeds[index],
-                    "prompt_text": prompt_batch.prompt_texts[index],
-                    "num_learnable_tokens": self.config.attack.num_learnable_tokens,
-                    "learnable_token_initializer": self.config.attack.learnable_token_initializer,
-                    "learnable_token_init_std": self.config.attack.learnable_token_init_std,
-                    "learnable_token_init_seed": self.config.attack.learnable_token_init_seed,
-                    "learnable_token_texts": " ".join(prompt_state.token_texts),
-                    "lr": self.config.attack.lr,
-                    "lr_scheduler": self.config.attack.lr_scheduler.name,
-                    "lr_warmup_steps": self.config.attack.lr_scheduler.warmup_steps,
-                    "lr_min": self.config.attack.lr_scheduler.min_lr,
-                    "steps": self.config.attack.steps,
-                    "lambda_sem": self.config.attack.lambda_sem,
-                    "attack_loss_weight": attack_loss_weight,
-                    "semantic_loss_weight": _logged_semantic_weight(
-                        self.config,
-                        semantic_loss_weight,
-                    ),
-                    "attack_margin": self.config.attack.attack_margin,
-                    "objective": self.config.attack.objective,
-                    "attack_batch_size": self.config.attack.batch_size,
-                    "generator_height": self.config.generator.height,
-                    "generator_width": self.config.generator.width,
-                    "generator_batch_size": self.config.generator.batch_size,
-                    "num_inference_steps": self.config.generator.num_inference_steps,
-                    "clean_pred": clean_eval.pred,
-                    "clean_pred_label": components.victim.categories[clean_eval.pred],
-                    "clean_top1_conf": clean_eval.pred_conf,
-                    "clean_correct": clean_correct,
-                    "adv_pred": adv_eval.pred,
-                    "adv_pred_label": components.victim.categories[adv_eval.pred],
-                    "adv_top1_conf": adv_eval.pred_conf,
-                    "success": success,
-                    "clean_true_conf": clean_eval.true_conf,
-                    "adv_true_conf": adv_eval.true_conf,
-                    "confidence_drop": clean_eval.true_conf - adv_eval.true_conf,
-                    "clean_margin": clean_eval.margin,
-                    "adv_margin": adv_eval.margin,
-                    "margin_drop": clean_eval.margin - adv_eval.margin,
-                    **_semantic_metric_fields(
-                        components.semantic,
-                        semantic_value,
-                        dino_value=dino_metric_value,
-                    ),
-                    "semantic_loss": float(semantic_losses[index].detach().cpu().item()),
-                    "weighted_semantic_loss": float(
-                        weighted_semantic_losses[index].detach().cpu().item()
-                    ),
-                    "ssim": ssim,
-                    **pixel_metrics,
-                    **nriqa_metrics,
-                    "best_step": final_step,
-                    "best_attack_step": final_step,
-                    "first_success_step": final_step if success else -1,
-                    "min_adv_true_conf": adv_eval.true_conf,
-                    "min_adv_true_conf_step": final_step,
-                    "min_adv_margin": adv_eval.margin,
-                    "min_adv_margin_step": final_step,
-                    "best_attack_loss": float(attack_losses[index].detach().cpu().item()),
-                    "best_semantic_loss": float(semantic_losses[index].detach().cpu().item()),
-                    "best_weighted_semantic_loss": float(
-                        weighted_semantic_losses[index].detach().cpu().item()
-                    ),
-                    "best_total_loss": float(total_losses[index].detach().cpu().item()),
-                    "runtime_seconds": runtime_seconds,
-                    "output_image_path": str(output_dir / "adv.png"),
-                    "original_image_path": str(output_dir / "original.png"),
-                    "grid_image_path": str(grid_path),
-                }
-                if metrics_path is not None:
-                    append_csv_row(metrics_path, row)
-                if logger is not None:
-                    logger.log_image_result(row=row, original=images[index], adversarial=adv_image)
-                rows.append(row)
-                seen += 1
-                clean_correct_count += int(clean_correct)
-                success_count += int(success)
-                clean_success_count += int(clean_correct and success)
-            if show_progress:
-                elapsed, eta = _progress_eta(
-                    started_at=eval_started_at,
-                    completed=batch_index + 1,
-                    total=len(batches),
-                )
-                asr = success_count / max(seen, 1)
-                clean_asr = clean_success_count / max(clean_correct_count, 1)
-                set_process_title(
-                    f"prompt_attack {stage}-eval {self.config.output.root.name} "
-                    f"{seen}/{len(records)} asr={asr:.3f} eta={_format_duration(eta)}"
-                )
-                progress.set_postfix(
-                    {
-                        "images": f"{seen}/{len(records)}",
-                        "asr": f"{asr:.3f}",
-                        "clean_asr": f"{clean_asr:.3f}",
-                        "eta": _format_duration(eta),
-                    },
-                    refresh=True,
-                )
-                progress.write(
-                    f"[{stage}] "
-                    f"batch {batch_index + 1}/{len(batches)} | "
-                    f"images={seen}/{len(records)} ({seen / max(len(records), 1):.1%}) | "
-                    f"clean_correct={clean_correct_count} | "
-                    f"success={success_count} | "
-                    f"asr={asr:.3f} | "
-                    f"clean_asr={clean_asr:.3f} | "
-                    f"elapsed={_format_duration(elapsed)} | "
-                    f"eta={_format_duration(eta)}",
-                )
+                    original_one = original_tensor[index : index + 1]
+                    adv_one = image_tensor[index : index + 1]
+                    success = adv_eval.pred != record.class_index
+                    clean_correct = clean_eval.pred == record.class_index
+                    semantic_value = float(semantic_sim[index].detach().cpu().item())
+                    dino_metric_value = (
+                        float(dino_metric_sim[index].detach().cpu().item())
+                        if dino_metric_sim is not None
+                        else None
+                    )
+                    pixel_metrics = pixel_distance_metrics(original_one, adv_one)
+                    ssim = global_ssim(original_one, adv_one)
+                    nriqa_metrics = (
+                        components.quality_evaluator.score_tensor(adv_one)
+                        if components.quality_evaluator is not None
+                        else {}
+                    )
+                    final_step = self.config.attack.steps
+                    row = {
+                        "stage": stage,
+                        "training_mode": "universal",
+                        "image_id": record.image_id,
+                        "class_id": record.class_index,
+                        "class_label": record.class_label,
+                        "run_name": self.config.generator.name,
+                        "seed": seeds[index],
+                        "prompt_text": prompt_batch.prompt_texts[index],
+                        "num_learnable_tokens": self.config.attack.num_learnable_tokens,
+                        "learnable_token_initializer": self.config.attack.learnable_token_initializer,
+                        "learnable_token_init_std": self.config.attack.learnable_token_init_std,
+                        "learnable_token_init_seed": self.config.attack.learnable_token_init_seed,
+                        "learnable_token_texts": " ".join(prompt_state.token_texts),
+                        "lr": self.config.attack.lr,
+                        "lr_scheduler": self.config.attack.lr_scheduler.name,
+                        "lr_warmup_steps": self.config.attack.lr_scheduler.warmup_steps,
+                        "lr_min": self.config.attack.lr_scheduler.min_lr,
+                        "steps": self.config.attack.steps,
+                        "lambda_sem": self.config.attack.lambda_sem,
+                        "attack_loss_weight": attack_loss_weight,
+                        "semantic_loss_weight": _logged_semantic_weight(
+                            self.config,
+                            semantic_loss_weight,
+                        ),
+                        "attack_margin": self.config.attack.attack_margin,
+                        "objective": self.config.attack.objective,
+                        "attack_batch_size": self.config.attack.batch_size,
+                        "generator_height": self.config.generator.height,
+                        "generator_width": self.config.generator.width,
+                        "generator_batch_size": self.config.generator.batch_size,
+                        "num_inference_steps": self.config.generator.num_inference_steps,
+                        "clean_pred": clean_eval.pred,
+                        "clean_pred_label": components.victim.categories[clean_eval.pred],
+                        "clean_top1_conf": clean_eval.pred_conf,
+                        "clean_correct": clean_correct,
+                        "adv_pred": adv_eval.pred,
+                        "adv_pred_label": components.victim.categories[adv_eval.pred],
+                        "adv_top1_conf": adv_eval.pred_conf,
+                        "success": success,
+                        "clean_true_conf": clean_eval.true_conf,
+                        "adv_true_conf": adv_eval.true_conf,
+                        "confidence_drop": clean_eval.true_conf - adv_eval.true_conf,
+                        "clean_margin": clean_eval.margin,
+                        "adv_margin": adv_eval.margin,
+                        "margin_drop": clean_eval.margin - adv_eval.margin,
+                        **_semantic_metric_fields(
+                            components.semantic,
+                            semantic_value,
+                            dino_value=dino_metric_value,
+                        ),
+                        "semantic_loss": float(semantic_losses[index].detach().cpu().item()),
+                        "weighted_semantic_loss": float(
+                            weighted_semantic_losses[index].detach().cpu().item()
+                        ),
+                        "ssim": ssim,
+                        **pixel_metrics,
+                        **nriqa_metrics,
+                        "best_step": final_step,
+                        "best_attack_step": final_step,
+                        "first_success_step": final_step if success else -1,
+                        "min_adv_true_conf": adv_eval.true_conf,
+                        "min_adv_true_conf_step": final_step,
+                        "min_adv_margin": adv_eval.margin,
+                        "min_adv_margin_step": final_step,
+                        "best_attack_loss": float(attack_losses[index].detach().cpu().item()),
+                        "best_semantic_loss": float(semantic_losses[index].detach().cpu().item()),
+                        "best_weighted_semantic_loss": float(
+                            weighted_semantic_losses[index].detach().cpu().item()
+                        ),
+                        "best_total_loss": float(total_losses[index].detach().cpu().item()),
+                        "runtime_seconds": runtime_seconds,
+                        "output_image_path": str(adv_output_path),
+                        "original_image_path": str(original_row_path),
+                        "grid_image_path": str(grid_path),
+                        "grid_saved": grid_saved,
+                    }
+                    if metrics_path is not None:
+                        append_csv_row(metrics_path, row)
+                    if logger is not None:
+                        logger.log_image_result(
+                            row=row, original=images[index], adversarial=adv_image
+                        )
+                    rows.append(row)
+                    seen += 1
+                    clean_correct_count += int(clean_correct)
+                    success_count += int(success)
+                    clean_success_count += int(clean_correct and success)
+                if show_progress:
+                    elapsed, eta = _progress_eta(
+                        started_at=eval_started_at,
+                        completed=batch_index + 1,
+                        total=len(batches),
+                    )
+                    asr = success_count / max(seen, 1)
+                    clean_asr = clean_success_count / max(clean_correct_count, 1)
+                    set_process_title(
+                        f"prompt_attack {stage}-eval {self.config.output.root.name} "
+                        f"{seen}/{len(records)} asr={asr:.3f} eta={_format_duration(eta)}"
+                    )
+                    progress.set_postfix(
+                        {
+                            "images": f"{seen}/{len(records)}",
+                            "asr": f"{asr:.3f}",
+                            "clean_asr": f"{clean_asr:.3f}",
+                            "eta": _format_duration(eta),
+                        },
+                        refresh=True,
+                    )
+                    progress.write(
+                        f"[{stage}] "
+                        f"batch {batch_index + 1}/{len(batches)} | "
+                        f"images={seen}/{len(records)} ({seen / max(len(records), 1):.1%}) | "
+                        f"clean_correct={clean_correct_count} | "
+                        f"success={success_count} | "
+                        f"asr={asr:.3f} | "
+                        f"clean_asr={clean_asr:.3f} | "
+                        f"elapsed={_format_duration(elapsed)} | "
+                        f"eta={_format_duration(eta)}",
+                    )
+        self._save_representative_grids(rows)
+        if (
+            metrics_path is not None
+            and self.config.output.grid_save_policy.lower() == "representative"
+        ):
+            write_csv_rows(metrics_path, rows)
         return rows
 
     def save_universal_prompt(
@@ -1082,9 +1222,7 @@ class LearnableTokenAttackRunner:
                 "image_tensor": generated.image_tensor.detach(),
                 "attack_loss": float(attack_loss.detach().cpu().item()),
                 "semantic_loss": float(semantic_loss_value.detach().cpu().item()),
-                "weighted_semantic_loss": float(
-                    weighted_semantic_loss.detach().cpu().item()
-                ),
+                "weighted_semantic_loss": float(weighted_semantic_loss.detach().cpu().item()),
                 "total_loss": float(total_loss.detach().cpu().item()),
                 "adv_pred": eval_result.pred,
                 "adv_top1_conf": eval_result.pred_conf,
@@ -1132,12 +1270,29 @@ class LearnableTokenAttackRunner:
 
         adv_image = tensor_to_pil(best["image_tensor"])
         output_dir = self.config.output.root / "images" / record.class_label / record.image_id
-        if self.config.output.save_images:
-            save_image(image, output_dir / "original.png")
-            save_image(adv_image, output_dir / "adv.png")
-        if self.config.output.save_grids:
-            grid = make_side_by_side(image, adv_image, "original", "adv")
-            save_image(grid, self.config.output.root / "grids" / f"{record.class_label}_{record.image_id}.png")
+        with self._image_writer() as image_writer:
+            original_output_path, adv_output_path = self._save_eval_images(
+                writer=image_writer,
+                original=image,
+                adversarial=adv_image,
+                output_dir=output_dir,
+            )
+            grid_path = self._grid_file_path(
+                stage=self.config.data.split or "data",
+                class_label=record.class_label,
+                image_id=record.image_id,
+            )
+            grid_saved = self._save_grid_if_all_policy(
+                writer=image_writer,
+                original=image,
+                adversarial=adv_image,
+                grid_path=grid_path,
+            )
+        original_row_path = (
+            original_output_path
+            if self.config.output.save_images and self.config.output.save_original_images
+            else record.path
+        )
 
         success = int(best["adv_pred"]) != record.class_index
         confidence_drop = clean_eval.true_conf - float(best["adv_true_conf"])
@@ -1221,12 +1376,13 @@ class LearnableTokenAttackRunner:
             "best_weighted_semantic_loss": float(best["weighted_semantic_loss"]),
             "best_total_loss": float(best["total_loss"]),
             "runtime_seconds": runtime_seconds,
-            "output_image_path": str(output_dir / "adv.png"),
-            "original_image_path": str(output_dir / "original.png"),
-            "grid_image_path": str(
-                self.config.output.root / "grids" / f"{record.class_label}_{record.image_id}.png"
-            ),
+            "output_image_path": str(adv_output_path),
+            "original_image_path": str(original_row_path),
+            "grid_image_path": str(grid_path),
+            "grid_saved": grid_saved,
         }
+        if self.config.output.grid_save_policy.lower() == "representative":
+            self._save_representative_grids([row])
         if logger is not None:
             logger.log_image_result(row=row, original=image, adversarial=adv_image)
         return row
@@ -1268,7 +1424,9 @@ class LearnableTokenAttackRunner:
             dtype=torch.long,
         )
         clean_logits = victim.logits_from_tensor(original_tensor)
-        clean_evals = victim.evaluate_logits_batch(clean_logits.detach(), true_labels.detach().cpu().tolist())
+        clean_evals = victim.evaluate_logits_batch(
+            clean_logits.detach(), true_labels.detach().cpu().tolist()
+        )
         prompt_state = generator.create_learnable_prompt_batch(
             class_labels=[record.class_label for record in records],
             num_tokens=self.config.attack.num_learnable_tokens,
@@ -1278,11 +1436,15 @@ class LearnableTokenAttackRunner:
         )
         learnable_embeddings = prompt_state.learnable_embeddings
         if not isinstance(learnable_embeddings, torch.Tensor):
-            raise TypeError("Generator batch prompt state must expose torch.Tensor learnable embeddings.")
+            raise TypeError(
+                "Generator batch prompt state must expose torch.Tensor learnable embeddings."
+            )
         if learnable_embeddings.ndim != 3:
             raise ValueError("Batch learnable-token parameter must have shape [B, N, D].")
         if learnable_embeddings.shape[0] != len(records):
-            raise ValueError("Batch learnable-token parameter batch dimension does not match records.")
+            raise ValueError(
+                "Batch learnable-token parameter batch dimension does not match records."
+            )
         if not learnable_embeddings.requires_grad:
             raise RuntimeError("Batch learnable-token parameter must require gradients.")
         optimizer = torch.optim.Adam([learnable_embeddings], lr=self.config.attack.lr)
@@ -1334,7 +1496,9 @@ class LearnableTokenAttackRunner:
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
-            eval_results = victim.evaluate_logits_batch(logits.detach(), true_labels.detach().cpu().tolist())
+            eval_results = victim.evaluate_logits_batch(
+                logits.detach(), true_labels.detach().cpu().tolist()
+            )
             if semantic_sim is None:
                 with torch.no_grad():
                     semantic_sim = semantic.similarity(original_tensor, image_tensor.detach())
@@ -1410,115 +1574,134 @@ class LearnableTokenAttackRunner:
         if components.dino_metric is not None:
             with torch.no_grad():
                 best_tensors = torch.cat(
-                    [
-                        best_row["image_tensor"]
-                        for best_row in best
-                        if best_row is not None
-                    ],
+                    [best_row["image_tensor"] for best_row in best if best_row is not None],
                     dim=0,
                 )
                 dino_metric_sim = components.dino_metric.similarity(original_tensor, best_tensors)
-        for index, record in enumerate(records):
-            best_row = best[index]
-            best_attack_row = best_attack[index]
-            min_true_conf_row = min_true_conf[index]
-            if best_row is None or best_attack_row is None or min_true_conf_row is None:
-                raise RuntimeError(f"No optimization step ran for {record.image_id}")
-            adv_image = tensor_to_pil(best_row["image_tensor"])
-            output_dir = self.config.output.root / "images" / record.class_label / record.image_id
-            if self.config.output.save_images:
-                save_image(images[index], output_dir / "original.png")
-                save_image(adv_image, output_dir / "adv.png")
-            grid_path = self.config.output.root / "grids" / f"{record.class_label}_{record.image_id}.png"
-            if self.config.output.save_grids:
-                grid = make_side_by_side(images[index], adv_image, "original", "adv")
-                save_image(grid, grid_path)
+        with self._image_writer() as image_writer:
+            for index, record in enumerate(records):
+                best_row = best[index]
+                best_attack_row = best_attack[index]
+                min_true_conf_row = min_true_conf[index]
+                if best_row is None or best_attack_row is None or min_true_conf_row is None:
+                    raise RuntimeError(f"No optimization step ran for {record.image_id}")
+                adv_image = tensor_to_pil(best_row["image_tensor"])
+                output_dir = (
+                    self.config.output.root / "images" / record.class_label / record.image_id
+                )
+                original_output_path, adv_output_path = self._save_eval_images(
+                    writer=image_writer,
+                    original=images[index],
+                    adversarial=adv_image,
+                    output_dir=output_dir,
+                )
+                original_row_path = (
+                    original_output_path
+                    if self.config.output.save_images and self.config.output.save_original_images
+                    else record.path
+                )
+                grid_path = self._grid_file_path(
+                    stage=self.config.data.split or "data",
+                    class_label=record.class_label,
+                    image_id=record.image_id,
+                )
+                grid_saved = self._save_grid_if_all_policy(
+                    writer=image_writer,
+                    original=images[index],
+                    adversarial=adv_image,
+                    grid_path=grid_path,
+                )
 
-            clean_eval = clean_evals[index]
-            success = int(best_row["adv_pred"]) != record.class_index
-            confidence_drop = clean_eval.true_conf - float(best_row["adv_true_conf"])
-            dino_metric_value = (
-                float(dino_metric_sim[index].detach().cpu().item())
-                if dino_metric_sim is not None
-                else None
-            )
-            original_one = original_tensor[index : index + 1]
-            pixel_metrics = pixel_distance_metrics(original_one, best_row["image_tensor"])
-            ssim = global_ssim(original_one, best_row["image_tensor"])
-            nriqa_metrics = (
-                quality_evaluator.score_tensor(best_row["image_tensor"])
-                if quality_evaluator is not None
-                else {}
-            )
-            row = {
-                "stage": self.config.data.split or "data",
-                "training_mode": self.config.attack.training_mode,
-                "image_id": record.image_id,
-                "class_id": record.class_index,
-                "class_label": record.class_label,
-                "run_name": self.config.generator.name,
-                "seed": seeds[index],
-                "prompt_text": prompt_state.prompt_texts[index],
-                "num_learnable_tokens": self.config.attack.num_learnable_tokens,
-                "learnable_token_initializer": self.config.attack.learnable_token_initializer,
-                "learnable_token_init_std": self.config.attack.learnable_token_init_std,
-                "learnable_token_init_seed": self.config.attack.learnable_token_init_seed,
-                "learnable_token_texts": " ".join(prompt_state.token_texts),
-                "lr": self.config.attack.lr,
-                "lr_scheduler": self.config.attack.lr_scheduler.name,
-                "lr_warmup_steps": self.config.attack.lr_scheduler.warmup_steps,
-                "lr_min": self.config.attack.lr_scheduler.min_lr,
-                "steps": self.config.attack.steps,
-                "lambda_sem": self.config.attack.lambda_sem,
-                "attack_loss_weight": attack_loss_weight,
-                "semantic_loss_weight": _logged_semantic_weight(self.config, semantic_loss_weight),
-                "attack_margin": self.config.attack.attack_margin,
-                "objective": self.config.attack.objective,
-                "attack_batch_size": self.config.attack.batch_size,
-                "generator_height": self.config.generator.height,
-                "generator_width": self.config.generator.width,
-                "generator_batch_size": self.config.generator.batch_size,
-                "num_inference_steps": self.config.generator.num_inference_steps,
-                "clean_pred": clean_eval.pred,
-                "clean_pred_label": victim.categories[clean_eval.pred],
-                "clean_top1_conf": clean_eval.pred_conf,
-                "adv_pred": int(best_row["adv_pred"]),
-                "adv_pred_label": victim.categories[int(best_row["adv_pred"])],
-                "adv_top1_conf": float(best_row["adv_top1_conf"]),
-                "success": success,
-                "clean_true_conf": clean_eval.true_conf,
-                "adv_true_conf": float(best_row["adv_true_conf"]),
-                "confidence_drop": confidence_drop,
-                "clean_margin": clean_eval.margin,
-                "adv_margin": float(best_row["adv_margin"]),
-                "margin_drop": clean_eval.margin - float(best_row["adv_margin"]),
-                **_semantic_metric_fields(
-                    semantic,
-                    float(best_row["semantic_similarity"]),
-                    dino_value=dino_metric_value,
-                ),
-                "semantic_loss": float(best_row["semantic_loss"]),
-                "weighted_semantic_loss": float(best_row["weighted_semantic_loss"]),
-                "ssim": ssim,
-                **pixel_metrics,
-                **nriqa_metrics,
-                "best_step": int(best_row["step"]),
-                "best_attack_step": int(best_attack_row["step"]),
-                "first_success_step": first_success_step[index],
-                "min_adv_true_conf": float(min_true_conf_row["adv_true_conf"]),
-                "min_adv_true_conf_step": int(min_true_conf_row["step"]),
-                "min_adv_margin": float(best_attack_row["adv_margin"]),
-                "min_adv_margin_step": int(best_attack_row["step"]),
-                "best_attack_loss": float(best_row["attack_loss"]),
-                "best_semantic_loss": float(best_row["semantic_loss"]),
-                "best_weighted_semantic_loss": float(best_row["weighted_semantic_loss"]),
-                "best_total_loss": float(best_row["total_loss"]),
-                "runtime_seconds": runtime_seconds,
-                "output_image_path": str(output_dir / "adv.png"),
-                "original_image_path": str(output_dir / "original.png"),
-                "grid_image_path": str(grid_path),
-            }
-            if logger is not None:
-                logger.log_image_result(row=row, original=images[index], adversarial=adv_image)
-            rows.append(row)
+                clean_eval = clean_evals[index]
+                success = int(best_row["adv_pred"]) != record.class_index
+                confidence_drop = clean_eval.true_conf - float(best_row["adv_true_conf"])
+                dino_metric_value = (
+                    float(dino_metric_sim[index].detach().cpu().item())
+                    if dino_metric_sim is not None
+                    else None
+                )
+                original_one = original_tensor[index : index + 1]
+                pixel_metrics = pixel_distance_metrics(original_one, best_row["image_tensor"])
+                ssim = global_ssim(original_one, best_row["image_tensor"])
+                nriqa_metrics = (
+                    quality_evaluator.score_tensor(best_row["image_tensor"])
+                    if quality_evaluator is not None
+                    else {}
+                )
+                row = {
+                    "stage": self.config.data.split or "data",
+                    "training_mode": self.config.attack.training_mode,
+                    "image_id": record.image_id,
+                    "class_id": record.class_index,
+                    "class_label": record.class_label,
+                    "run_name": self.config.generator.name,
+                    "seed": seeds[index],
+                    "prompt_text": prompt_state.prompt_texts[index],
+                    "num_learnable_tokens": self.config.attack.num_learnable_tokens,
+                    "learnable_token_initializer": self.config.attack.learnable_token_initializer,
+                    "learnable_token_init_std": self.config.attack.learnable_token_init_std,
+                    "learnable_token_init_seed": self.config.attack.learnable_token_init_seed,
+                    "learnable_token_texts": " ".join(prompt_state.token_texts),
+                    "lr": self.config.attack.lr,
+                    "lr_scheduler": self.config.attack.lr_scheduler.name,
+                    "lr_warmup_steps": self.config.attack.lr_scheduler.warmup_steps,
+                    "lr_min": self.config.attack.lr_scheduler.min_lr,
+                    "steps": self.config.attack.steps,
+                    "lambda_sem": self.config.attack.lambda_sem,
+                    "attack_loss_weight": attack_loss_weight,
+                    "semantic_loss_weight": _logged_semantic_weight(
+                        self.config, semantic_loss_weight
+                    ),
+                    "attack_margin": self.config.attack.attack_margin,
+                    "objective": self.config.attack.objective,
+                    "attack_batch_size": self.config.attack.batch_size,
+                    "generator_height": self.config.generator.height,
+                    "generator_width": self.config.generator.width,
+                    "generator_batch_size": self.config.generator.batch_size,
+                    "num_inference_steps": self.config.generator.num_inference_steps,
+                    "clean_pred": clean_eval.pred,
+                    "clean_pred_label": victim.categories[clean_eval.pred],
+                    "clean_top1_conf": clean_eval.pred_conf,
+                    "adv_pred": int(best_row["adv_pred"]),
+                    "adv_pred_label": victim.categories[int(best_row["adv_pred"])],
+                    "adv_top1_conf": float(best_row["adv_top1_conf"]),
+                    "success": success,
+                    "clean_true_conf": clean_eval.true_conf,
+                    "adv_true_conf": float(best_row["adv_true_conf"]),
+                    "confidence_drop": confidence_drop,
+                    "clean_margin": clean_eval.margin,
+                    "adv_margin": float(best_row["adv_margin"]),
+                    "margin_drop": clean_eval.margin - float(best_row["adv_margin"]),
+                    **_semantic_metric_fields(
+                        semantic,
+                        float(best_row["semantic_similarity"]),
+                        dino_value=dino_metric_value,
+                    ),
+                    "semantic_loss": float(best_row["semantic_loss"]),
+                    "weighted_semantic_loss": float(best_row["weighted_semantic_loss"]),
+                    "ssim": ssim,
+                    **pixel_metrics,
+                    **nriqa_metrics,
+                    "best_step": int(best_row["step"]),
+                    "best_attack_step": int(best_attack_row["step"]),
+                    "first_success_step": first_success_step[index],
+                    "min_adv_true_conf": float(min_true_conf_row["adv_true_conf"]),
+                    "min_adv_true_conf_step": int(min_true_conf_row["step"]),
+                    "min_adv_margin": float(best_attack_row["adv_margin"]),
+                    "min_adv_margin_step": int(best_attack_row["step"]),
+                    "best_attack_loss": float(best_row["attack_loss"]),
+                    "best_semantic_loss": float(best_row["semantic_loss"]),
+                    "best_weighted_semantic_loss": float(best_row["weighted_semantic_loss"]),
+                    "best_total_loss": float(best_row["total_loss"]),
+                    "runtime_seconds": runtime_seconds,
+                    "output_image_path": str(adv_output_path),
+                    "original_image_path": str(original_row_path),
+                    "grid_image_path": str(grid_path),
+                    "grid_saved": grid_saved,
+                }
+                if logger is not None:
+                    logger.log_image_result(row=row, original=images[index], adversarial=adv_image)
+                rows.append(row)
+        if self.config.output.grid_save_policy.lower() == "representative":
+            self._save_representative_grids(rows)
         return rows

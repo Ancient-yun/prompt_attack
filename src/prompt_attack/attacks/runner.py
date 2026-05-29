@@ -7,6 +7,8 @@ import json
 import random
 import time
 from collections import defaultdict
+from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from math import cos, pi
 from pathlib import Path
@@ -47,6 +49,15 @@ from prompt_attack.utils.wandb_logger import WandbLogger
 CLEAN_FILTER_BATCH_SIZE = 512
 CLEAN_FILTER_CACHE_DIR = Path("outputs/cache/clean_correct")
 TRAIN_SHUFFLE_SEED = 0
+
+
+@dataclass(frozen=True)
+class LoadedBatchInputs:
+    """CPU-side loaded image batch ready to move to the training device."""
+
+    images: list[Any]
+    original_tensor: Any
+    labels: list[int]
 
 
 def _format_duration(seconds: float) -> str:
@@ -492,6 +503,79 @@ class LearnableTokenAttackRunner:
         )
         return images, original_tensor, true_labels
 
+    def _load_batch_inputs_cpu(self, records: list[ImageRecord]) -> LoadedBatchInputs:
+        """Load and resize a batch on CPU for background prefetch."""
+        import torch
+        import torchvision.transforms.functional as F
+
+        images = [load_image(record.path) for record in records]
+        reference_images = [
+            image.resize((self.config.generator.width, self.config.generator.height))
+            for image in images
+        ]
+        original_tensor = torch.cat(
+            [F.to_tensor(image).unsqueeze(0) for image in reference_images],
+            dim=0,
+        ).to(dtype=torch.float32)
+        labels = [record.class_index for record in records]
+        return LoadedBatchInputs(
+            images=images,
+            original_tensor=original_tensor,
+            labels=labels,
+        )
+
+    def _loaded_batch_to_device(self, loaded: LoadedBatchInputs):
+        """Move a prefetched CPU batch to the configured device."""
+        import torch
+
+        original_tensor = loaded.original_tensor
+        non_blocking = False
+        if str(self.device).startswith("cuda"):
+            original_tensor = original_tensor.pin_memory()
+            non_blocking = True
+        original_tensor = original_tensor.to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=non_blocking,
+        )
+        true_labels = torch.tensor(
+            loaded.labels,
+            device=self.device,
+            dtype=torch.long,
+        )
+        return loaded.images, original_tensor, true_labels
+
+    def _prefetched_record_batches(
+        self,
+        batches: list[list[ImageRecord]],
+        *,
+        enabled: bool,
+    ) -> Iterator[tuple[list[ImageRecord], list[Any], Any, Any]]:
+        """Yield batches with CPU image loading overlapped with GPU work."""
+        if not enabled or len(batches) <= 1:
+            for batch in batches:
+                images, original_tensor, true_labels = self._load_batch_inputs(batch)
+                yield batch, images, original_tensor, true_labels
+            return
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending: Future[LoadedBatchInputs] | None = executor.submit(
+                self._load_batch_inputs_cpu,
+                batches[0],
+            )
+            for index, batch in enumerate(batches):
+                if pending is None:
+                    raise RuntimeError("Missing prefetched batch.")
+                loaded = pending.result()
+                next_index = index + 1
+                pending = (
+                    executor.submit(self._load_batch_inputs_cpu, batches[next_index])
+                    if next_index < len(batches)
+                    else None
+                )
+                images, original_tensor, true_labels = self._loaded_batch_to_device(loaded)
+                yield batch, images, original_tensor, true_labels
+
     def run(self, *, max_images: int | None = None) -> list[dict[str, Any]]:
         """Run the configured attack and persist outputs."""
         if self.config.attack.training_mode == "universal":
@@ -627,8 +711,16 @@ class LearnableTokenAttackRunner:
             step_success = 0
             processed = 0
 
-            for micro_batch in self._record_batches(local_batch, batch_size=micro_batch_size):
-                images, original_tensor, true_labels = self._load_batch_inputs(micro_batch)
+            micro_batches = self._record_batches(local_batch, batch_size=micro_batch_size)
+            for (
+                micro_batch,
+                images,
+                original_tensor,
+                true_labels,
+            ) in self._prefetched_record_batches(
+                micro_batches,
+                enabled=True,
+            ):
                 prompt_batch = self._shared_prompt_batch(prompt_state, micro_batch)
                 seeds = [stable_image_seed(0, record.image_id) for record in micro_batch]
                 generated = components.generator.generate_batch(
@@ -803,9 +895,14 @@ class LearnableTokenAttackRunner:
             dynamic_ncols=True,
         )
         with self._image_writer() as image_writer:
-            for batch_index, batch in enumerate(progress):
+            prefetched_batches = self._prefetched_record_batches(
+                batches,
+                enabled=True,
+            )
+            for batch_index, (batch, images, original_tensor, true_labels) in enumerate(
+                prefetched_batches
+            ):
                 started_at = time.perf_counter()
-                images, original_tensor, true_labels = self._load_batch_inputs(batch)
                 prompt_batch = self._shared_prompt_batch(prompt_state, batch)
                 seeds = [stable_image_seed(0, record.image_id) for record in batch]
                 generated = components.generator.generate_batch(

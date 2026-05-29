@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also copy original images into the output tree. Default keeps source paths only.",
     )
-    parser.add_argument("--image-format", default="jpg", choices=("png", "jpg", "jpeg", "webp"))
+    parser.add_argument("--image-format", default="png", choices=("png", "jpg", "jpeg", "webp"))
     parser.add_argument("--image-quality", type=int, default=95)
     parser.add_argument("--image-save-workers", type=int, default=4)
     parser.add_argument(

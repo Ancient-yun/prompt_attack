@@ -81,7 +81,7 @@ class OutputConfig:
     save_adv_images: bool = True
     grid_save_policy: str = "representative"
     max_saved_grids: int = 48
-    image_format: str = "jpg"
+    image_format: str = "png"
     image_quality: int = 95
     image_save_workers: int = 4
 
@@ -212,7 +212,7 @@ def load_config(path: Path) -> ExperimentConfig:
     grid_save_policy = str(output_raw.get("grid_save_policy", "representative")).lower()
     if grid_save_policy not in {"representative", "all", "none"}:
         raise ValueError("Config field 'output.grid_save_policy' must be representative, all, or none.")
-    image_format = str(output_raw.get("image_format", "jpg")).lower()
+    image_format = str(output_raw.get("image_format", "png")).lower()
     if image_format not in {"png", "jpg", "jpeg", "webp"}:
         raise ValueError("Config field 'output.image_format' must be png, jpg, jpeg, or webp.")
 

@@ -313,6 +313,7 @@ def test_attack_batch_uses_generator_batch_forward(tmp_path: Path) -> None:
     components = AttackComponents(
         victim=TinyVictim(),
         semantic=TinySemantic(),
+        dino_metric=None,
         generator=generator,
         quality_evaluator=EmptyQuality(),
     )
@@ -363,6 +364,7 @@ def test_universal_prompt_trains_shared_embedding_and_evaluates(tmp_path: Path) 
     components = AttackComponents(
         victim=TinyVictim(),
         semantic=TinySemantic(),
+        dino_metric=None,
         generator=MockEditableGenerator(device="cpu"),
         quality_evaluator=EmptyQuality(),
     )

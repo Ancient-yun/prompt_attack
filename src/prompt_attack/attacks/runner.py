@@ -65,7 +65,12 @@ def _progress_eta(*, started_at: float, completed: int, total: int) -> tuple[flo
     return elapsed, eta
 
 
-def _semantic_metric_fields(semantic: Any, value: float) -> dict[str, Any]:
+def _semantic_metric_fields(
+    semantic: Any,
+    value: float,
+    *,
+    dino_value: float | None = None,
+) -> dict[str, Any]:
     """Return generic and model-specific semantic similarity CSV fields."""
     metric_name = str(getattr(semantic, "metric_name", "semantic_similarity"))
     fields: dict[str, Any] = {
@@ -79,6 +84,8 @@ def _semantic_metric_fields(semantic: Any, value: float) -> dict[str, Any]:
         fields["dino_similarity"] = value
     elif metric_name == "clip_image_similarity":
         fields["clip_image_similarity"] = value
+    if dino_value is not None:
+        fields["dino_similarity"] = dino_value
     return fields
 
 
@@ -95,6 +102,7 @@ class AttackComponents:
 
     victim: Any
     semantic: Any
+    dino_metric: Any | None
     generator: Any
     quality_evaluator: Any
 
@@ -114,6 +122,9 @@ class LearnableTokenAttackRunner:
             device=self.device,
         )
         semantic = build_semantic_model(self.config.semantic.name, device=self.device)
+        dino_metric = None
+        if str(getattr(semantic, "metric_name", "")) != "dino_similarity":
+            dino_metric = build_semantic_model("dinov2_vitb14", device=self.device)
         generator = build_generator(self.config.generator, device=self.device)
         quality_evaluator = NoReferenceIQAEvaluator(
             self.config.quality.nriqa,
@@ -127,6 +138,7 @@ class LearnableTokenAttackRunner:
         return AttackComponents(
             victim=victim,
             semantic=semantic,
+            dino_metric=dino_metric,
             generator=generator,
             quality_evaluator=quality_evaluator,
         )
@@ -705,6 +717,11 @@ class LearnableTokenAttackRunner:
                     true_labels.detach().cpu().tolist(),
                 )
                 semantic_sim = components.semantic.similarity(original_tensor, image_tensor)
+                dino_metric_sim = (
+                    components.dino_metric.similarity(original_tensor, image_tensor)
+                    if components.dino_metric is not None
+                    else None
+                )
                 attack_losses, semantic_losses, weighted_semantic_losses, total_losses = (
                     objective_loss_components(
                         adv_logits,
@@ -740,6 +757,11 @@ class LearnableTokenAttackRunner:
                 success = adv_eval.pred != record.class_index
                 clean_correct = clean_eval.pred == record.class_index
                 semantic_value = float(semantic_sim[index].detach().cpu().item())
+                dino_metric_value = (
+                    float(dino_metric_sim[index].detach().cpu().item())
+                    if dino_metric_sim is not None
+                    else None
+                )
                 pixel_metrics = pixel_distance_metrics(original_one, adv_one)
                 ssim = global_ssim(original_one, adv_one)
                 nriqa_metrics = (
@@ -794,7 +816,11 @@ class LearnableTokenAttackRunner:
                     "clean_margin": clean_eval.margin,
                     "adv_margin": adv_eval.margin,
                     "margin_drop": clean_eval.margin - adv_eval.margin,
-                    **_semantic_metric_fields(components.semantic, semantic_value),
+                    **_semantic_metric_fields(
+                        components.semantic,
+                        semantic_value,
+                        dino_value=dino_metric_value,
+                    ),
                     "semantic_loss": float(semantic_losses[index].detach().cpu().item()),
                     "weighted_semantic_loss": float(
                         weighted_semantic_losses[index].detach().cpu().item()
@@ -1115,6 +1141,14 @@ class LearnableTokenAttackRunner:
 
         success = int(best["adv_pred"]) != record.class_index
         confidence_drop = clean_eval.true_conf - float(best["adv_true_conf"])
+        dino_metric_value = None
+        if components.dino_metric is not None:
+            with torch.no_grad():
+                dino_metric_sim = components.dino_metric.similarity(
+                    original_tensor,
+                    best["image_tensor"],
+                )
+                dino_metric_value = float(dino_metric_sim.detach().cpu().item())
         pixel_metrics = pixel_distance_metrics(original_tensor, best["image_tensor"])
         ssim = global_ssim(original_tensor, best["image_tensor"])
         nriqa_metrics = (
@@ -1165,7 +1199,11 @@ class LearnableTokenAttackRunner:
             "clean_margin": clean_eval.margin,
             "adv_margin": float(best["adv_margin"]),
             "margin_drop": clean_eval.margin - float(best["adv_margin"]),
-            **_semantic_metric_fields(semantic, float(best["semantic_similarity"])),
+            **_semantic_metric_fields(
+                semantic,
+                float(best["semantic_similarity"]),
+                dino_value=dino_metric_value,
+            ),
             "semantic_loss": float(best["semantic_loss"]),
             "weighted_semantic_loss": float(best["weighted_semantic_loss"]),
             "ssim": ssim,
@@ -1368,6 +1406,18 @@ class LearnableTokenAttackRunner:
 
         rows: list[dict[str, Any]] = []
         runtime_seconds = time.perf_counter() - started_at
+        dino_metric_sim = None
+        if components.dino_metric is not None:
+            with torch.no_grad():
+                best_tensors = torch.cat(
+                    [
+                        best_row["image_tensor"]
+                        for best_row in best
+                        if best_row is not None
+                    ],
+                    dim=0,
+                )
+                dino_metric_sim = components.dino_metric.similarity(original_tensor, best_tensors)
         for index, record in enumerate(records):
             best_row = best[index]
             best_attack_row = best_attack[index]
@@ -1387,6 +1437,11 @@ class LearnableTokenAttackRunner:
             clean_eval = clean_evals[index]
             success = int(best_row["adv_pred"]) != record.class_index
             confidence_drop = clean_eval.true_conf - float(best_row["adv_true_conf"])
+            dino_metric_value = (
+                float(dino_metric_sim[index].detach().cpu().item())
+                if dino_metric_sim is not None
+                else None
+            )
             original_one = original_tensor[index : index + 1]
             pixel_metrics = pixel_distance_metrics(original_one, best_row["image_tensor"])
             ssim = global_ssim(original_one, best_row["image_tensor"])
@@ -1437,7 +1492,11 @@ class LearnableTokenAttackRunner:
                 "clean_margin": clean_eval.margin,
                 "adv_margin": float(best_row["adv_margin"]),
                 "margin_drop": clean_eval.margin - float(best_row["adv_margin"]),
-                **_semantic_metric_fields(semantic, float(best_row["semantic_similarity"])),
+                **_semantic_metric_fields(
+                    semantic,
+                    float(best_row["semantic_similarity"]),
+                    dino_value=dino_metric_value,
+                ),
                 "semantic_loss": float(best_row["semantic_loss"]),
                 "weighted_semantic_loss": float(best_row["weighted_semantic_loss"]),
                 "ssim": ssim,

@@ -205,10 +205,15 @@ def short_objective_label(objective: str) -> str:
 
 
 def process_title(args: argparse.Namespace, stage: str) -> str:
-    """Return a concise process title for ps/nvidia-smi visibility."""
+    """Return a readable process title for ps/nvidia-smi visibility."""
+    stage_label = {
+        "tr-eval": "train-eval",
+    }.get(stage, stage)
     return (
-        f"pa:{stage}:{short_objective_label(args.objective)}:"
-        f"t{args.num_tokens}:gb{global_batch_size(args)}"
+        f"prompt-attack uap {stage_label} "
+        f"obj={short_objective_label(args.objective)} "
+        f"tokens={args.num_tokens} "
+        f"global_batch={global_batch_size(args)}"
     )
 
 

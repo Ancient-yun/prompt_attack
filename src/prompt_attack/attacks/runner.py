@@ -99,13 +99,21 @@ def _short_objective_label(objective: str) -> str:
     return labels.get(normalized, normalized[:10])
 
 
-def _compact_process_title(config: ExperimentConfig, stage: str, suffix: str = "") -> str:
-    """Return a short process title for ps/nvidia-smi visibility."""
-    title = (
-        f"pa:{stage}:{_short_objective_label(config.attack.objective)}:"
-        f"t{config.attack.num_learnable_tokens}:gb{config.attack.batch_size}"
-    )
-    return f"{title}:{suffix}" if suffix else title
+def _process_title(config: ExperimentConfig, stage: str, **fields: str | int | float) -> str:
+    """Return a readable process title for ps/nvidia-smi visibility."""
+    stage_label = {
+        "tr-eval": "train-eval",
+    }.get(stage, stage)
+    parts = [
+        "prompt-attack",
+        "uap",
+        stage_label,
+        f"obj={_short_objective_label(config.attack.objective)}",
+        f"tokens={config.attack.num_learnable_tokens}",
+        f"global_batch={config.attack.batch_size}",
+    ]
+    parts.extend(f"{key}={value}" for key, value in fields.items())
+    return " ".join(parts)
 
 
 def _progress_eta(*, started_at: float, completed: int, total: int) -> tuple[float, float]:
@@ -923,11 +931,12 @@ class LearnableTokenAttackRunner:
             if dist_context.is_rank0:
                 history.append(history_row)
                 set_process_title(
-                    _compact_process_title(
+                    _process_title(
                         self.config,
                         "train",
-                        f"{completed_steps}/{self.config.attack.steps}:"
-                        f"a{history_row['success_rate']:.2f}:e{_format_duration(eta)}",
+                        step=f"{completed_steps}/{self.config.attack.steps}",
+                        asr=f"{history_row['success_rate']:.2f}",
+                        eta=_format_duration(eta),
                     )
                 )
                 progress.set_postfix(
@@ -1203,10 +1212,12 @@ class LearnableTokenAttackRunner:
                     asr = success_count / max(seen, 1)
                     clean_asr = clean_success_count / max(clean_correct_count, 1)
                     set_process_title(
-                        _compact_process_title(
+                        _process_title(
                             self.config,
                             f"{stage}-eval",
-                            f"{seen}/{len(records)}:a{asr:.2f}:e{_format_duration(eta)}",
+                            images=f"{seen}/{len(records)}",
+                            asr=f"{asr:.2f}",
+                            eta=_format_duration(eta),
                         )
                     )
                     progress.set_postfix(

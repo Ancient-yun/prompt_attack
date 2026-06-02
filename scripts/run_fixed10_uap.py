@@ -38,6 +38,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/flux2_resnet18.yaml"))
     parser.add_argument("--root", type=Path, default=Path("outputs/uap_fixed10"))
+    parser.add_argument(
+        "--run-name",
+        help="Override the generated output folder name with a concise explicit name.",
+    )
     parser.add_argument("--imagenet-root", type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--train-images-per-class", default="10")
@@ -70,6 +74,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--learnable-token-initializer", default="object")
     parser.add_argument("--learnable-token-init-seed", type=int, default=0)
+    parser.add_argument(
+        "--init-prompt",
+        type=Path,
+        help="Path to an existing prompt/learned_prompt.pt used as the initial token state.",
+    )
+    parser.add_argument(
+        "--base-epochs",
+        type=int,
+        default=0,
+        help="Number of epochs represented by --init-prompt, for metadata only.",
+    )
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--generator", default="flux2", choices=("flux2", "mock"))
@@ -149,6 +164,8 @@ def terminal_stage(index: int, total: int, title: str) -> None:
 
 
 def run_name(args: argparse.Namespace, *, train_ipc: int | None, test_ipc: int | None) -> str:
+    if args.run_name:
+        return args.run_name
     train_label = images_per_class_label(train_ipc)
     test_label = images_per_class_label(test_ipc)
     objective_label = args.objective.lower().replace("-", "_")
@@ -160,6 +177,38 @@ def run_name(args: argparse.Namespace, *, train_ipc: int | None, test_ipc: int |
         f"gb{global_batch_size(args)}_gbs{args.generator_batch_size}_"
         f"epochs{args.epochs}_nis{args.num_inference_steps}_tokens{args.num_tokens}_"
         f"{objective_label}_init{initializer_label}_lam{lambda_label}_semw{semantic_weight_label}"
+    )
+
+
+def short_objective_label(objective: str) -> str:
+    """Return a compact objective label for process titles."""
+    normalized = objective.lower().replace("-", "_")
+    labels = {
+        "negative_cross_entropy": "ce",
+        "neg_cross_entropy": "ce",
+        "negce": "ce",
+        "untargeted_negative_cross_entropy": "ce",
+        "untargeted_margin": "margin",
+        "clip_img2img": "clip",
+        "clip_image": "clip",
+        "clip_image_to_image": "clip",
+        "clip_only": "clip",
+        "dino_img2img": "dino",
+        "dino_image": "dino",
+        "dino_image_to_image": "dino",
+        "dino_only": "dino",
+        "margin_clip_img2img": "mclip",
+        "margin_dino": "mdino",
+        "cr": "cr",
+    }
+    return labels.get(normalized, normalized[:10])
+
+
+def process_title(args: argparse.Namespace, stage: str) -> str:
+    """Return a concise process title for ps/nvidia-smi visibility."""
+    return (
+        f"pa:{stage}:{short_objective_label(args.objective)}:"
+        f"t{args.num_tokens}:gb{global_batch_size(args)}"
     )
 
 
@@ -233,6 +282,7 @@ def build_stage_config(
             num_learnable_tokens=args.num_tokens,
             learnable_token_initializer=args.learnable_token_initializer,
             learnable_token_init_seed=args.learnable_token_init_seed,
+            init_prompt_path=args.init_prompt,
             lr=args.lr,
             steps=steps,
             lambda_sem=args.lambda_sem,
@@ -295,6 +345,34 @@ def compute_steps(record_count: int, args: argparse.Namespace) -> int:
     return updates_per_epoch * max(1, args.epochs)
 
 
+def continuation_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    """Return metadata that describes a learned-prompt continuation run."""
+    if args.init_prompt is None:
+        return {}
+
+    import torch
+
+    checkpoint = torch.load(args.init_prompt, map_location="cpu")
+    source_prompt_metadata = (
+        checkpoint.get("metadata", {}) if isinstance(checkpoint, dict) else {}
+    )
+    source_run_name = (
+        source_prompt_metadata.get("run_name")
+        if isinstance(source_prompt_metadata, dict)
+        else None
+    )
+    base_epochs = max(0, int(args.base_epochs))
+    additional_epochs = max(1, int(args.epochs))
+    return {
+        "init_prompt_path": str(args.init_prompt),
+        "base_epochs": base_epochs,
+        "additional_epochs": additional_epochs,
+        "total_epochs": base_epochs + additional_epochs,
+        "source_run_name": source_run_name,
+        "source_prompt_metadata": source_prompt_metadata,
+    }
+
+
 def batch_count(record_count: int, batch_size: int) -> int:
     return max(1, math.ceil(record_count / max(1, batch_size)))
 
@@ -320,6 +398,9 @@ def print_run_overview(
         ("objective", args.objective),
         ("initializer", args.learnable_token_initializer),
         ("init seed", args.learnable_token_init_seed),
+        ("init prompt", args.init_prompt or "fresh"),
+        ("base epochs", args.base_epochs),
+        ("total epochs label", args.base_epochs + args.epochs),
         ("attack margin", args.attack_margin),
         (
             "semantic model",
@@ -406,8 +487,9 @@ def main() -> None:
     name = run_name(args, train_ipc=train_ipc, test_ipc=test_ipc)
     output_root = args.root / name
     metrics_dir = output_root / "metrics"
+    prompt_continuation_metadata = continuation_metadata(args)
     stage_total = 4 + int(args.save_train_images)
-    set_process_title(f"prompt_attack setup {name}")
+    set_process_title(process_title(args, "setup"))
     if dist_context.is_rank0:
         ensure_dir(metrics_dir)
         remove_previous_outputs(metrics_dir, dist_context=dist_context)
@@ -428,7 +510,7 @@ def main() -> None:
 
     if dist_context.is_rank0:
         terminal_stage(1, stage_total, "load models and select train/test records")
-        set_process_title(f"prompt_attack load-records {name}")
+        set_process_title(process_title(args, "load"))
     train_probe_config = build_stage_config(
         args,
         split="train",
@@ -491,7 +573,7 @@ def main() -> None:
     try:
         if dist_context.is_rank0:
             terminal_stage(2, stage_total, "train shared learnable-token prompt")
-            set_process_title(f"prompt_attack train-start {name}")
+            set_process_title(process_title(args, "train"))
         prompt_state, history = train_runner.train_universal_prompt(
             train_records,
             components,
@@ -503,7 +585,7 @@ def main() -> None:
         if args.save_train_images:
             if dist_context.is_rank0:
                 terminal_stage(3, stage_total, "frozen train-set image save/eval")
-                set_process_title(f"prompt_attack train-eval-start {name}")
+                set_process_title(process_title(args, "tr-eval"))
             train_rank_path = (
                 metrics_dir / f"train_results_rank{dist_context.rank}.csv"
                 if dist_context.is_distributed
@@ -522,7 +604,7 @@ def main() -> None:
         if dist_context.is_rank0:
             test_stage = 4 if args.save_train_images else 3
             terminal_stage(test_stage, stage_total, "frozen val/test eval")
-            set_process_title(f"prompt_attack test-eval-start {name}")
+            set_process_title(process_title(args, "test"))
         test_rank_path = (
             metrics_dir / f"test_results_rank{dist_context.rank}.csv"
             if dist_context.is_distributed
@@ -542,7 +624,7 @@ def main() -> None:
         if dist_context.is_rank0:
             merge_stage = 5 if args.save_train_images else 4
             terminal_stage(merge_stage, stage_total, "merge metrics and write summary")
-            set_process_title(f"prompt_attack summarize {name}")
+            set_process_title(process_title(args, "summary"))
             if dist_context.is_distributed:
                 if args.save_train_images:
                     train_rows = merge_csv_files(
@@ -596,6 +678,7 @@ def main() -> None:
                 "image_format": args.image_format,
                 "grid_save_policy": args.grid_save_policy,
                 "max_saved_grids": args.max_saved_grids,
+                **prompt_continuation_metadata,
                 "train": train_summary,
                 "test": test_summary,
                 "final_train_history": history[-1] if history else None,
@@ -630,6 +713,7 @@ def main() -> None:
                     "image_format": args.image_format,
                     "grid_save_policy": args.grid_save_policy,
                     "max_saved_grids": args.max_saved_grids,
+                    **prompt_continuation_metadata,
                 },
             )
             if logger is not None:
@@ -653,7 +737,7 @@ def main() -> None:
                 f"elapsed_sec={elapsed:.1f}",
                 flush=True,
             )
-            set_process_title(f"prompt_attack done {name}")
+            set_process_title(process_title(args, "done"))
             if dist_context.is_distributed:
                 for rank in range(dist_context.world_size):
                     for prefix in ("train_results", "test_results"):

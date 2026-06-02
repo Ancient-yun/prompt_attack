@@ -9,7 +9,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from math import cos, pi
 from pathlib import Path
 from typing import Any
@@ -20,6 +20,7 @@ from prompt_attack.attacks.learnable_tokens import build_prompt
 from prompt_attack.attacks.losses import (
     attack_semantic_loss_weights,
     is_margin_dino_constraint_objective,
+    is_semantic_only_objective,
     objective_loss_components,
 )
 from prompt_attack.config import ExperimentConfig
@@ -48,6 +49,8 @@ from prompt_attack.utils.wandb_logger import WandbLogger
 
 CLEAN_FILTER_BATCH_SIZE = 512
 CLEAN_FILTER_CACHE_DIR = Path("outputs/cache/clean_correct")
+CLEAN_FILTER_CACHE_VERSION = 2
+CLEAN_FILTER_PREPROCESS_SIGNATURE = "torchvision_weights_transforms_pil_batch_v1"
 TRAIN_SHUFFLE_SEED = 0
 
 
@@ -70,6 +73,39 @@ def _format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes:d}m{secs:02d}s"
     return f"{secs:d}s"
+
+
+def _short_objective_label(objective: str) -> str:
+    """Return a compact objective label for process titles."""
+    normalized = objective.lower().replace("-", "_")
+    labels = {
+        "negative_cross_entropy": "ce",
+        "neg_cross_entropy": "ce",
+        "negce": "ce",
+        "untargeted_negative_cross_entropy": "ce",
+        "untargeted_margin": "margin",
+        "clip_img2img": "clip",
+        "clip_image": "clip",
+        "clip_image_to_image": "clip",
+        "clip_only": "clip",
+        "dino_img2img": "dino",
+        "dino_image": "dino",
+        "dino_image_to_image": "dino",
+        "dino_only": "dino",
+        "margin_clip_img2img": "mclip",
+        "margin_dino": "mdino",
+        "cr": "cr",
+    }
+    return labels.get(normalized, normalized[:10])
+
+
+def _compact_process_title(config: ExperimentConfig, stage: str, suffix: str = "") -> str:
+    """Return a short process title for ps/nvidia-smi visibility."""
+    title = (
+        f"pa:{stage}:{_short_objective_label(config.attack.objective)}:"
+        f"t{config.attack.num_learnable_tokens}:gb{config.attack.batch_size}"
+    )
+    return f"{title}:{suffix}" if suffix else title
 
 
 def _progress_eta(*, started_at: float, completed: int, total: int) -> tuple[float, float]:
@@ -108,6 +144,8 @@ def _semantic_metric_fields(
 
 def _logged_semantic_weight(config: ExperimentConfig, objective_weight: float) -> float:
     """Return the semantic loss weight that actually scales the configured objective."""
+    if is_semantic_only_objective(config.attack.objective):
+        return 1.0
     if is_margin_dino_constraint_objective(config.attack.objective):
         return config.attack.semantic_loss_weight
     return objective_weight
@@ -400,6 +438,8 @@ class LearnableTokenAttackRunner:
 
     def _clean_correct_cache_path(self) -> tuple[Path, dict[str, Any]]:
         metadata = {
+            "cache_version": CLEAN_FILTER_CACHE_VERSION,
+            "preprocess_signature": CLEAN_FILTER_PREPROCESS_SIGNATURE,
             "imagenet_root": str(self.config.data.imagenet_root),
             "split": self.config.data.split,
             "class_mode": self.config.data.class_mode,
@@ -638,6 +678,55 @@ class LearnableTokenAttackRunner:
             init_seed=self.config.attack.learnable_token_init_seed,
         )
 
+    def _apply_initial_prompt_checkpoint(self, prompt_state: LearnablePrompt) -> LearnablePrompt:
+        """Replace a fresh universal prompt parameter with a saved learned prompt."""
+        init_prompt_path = self.config.attack.init_prompt_path
+        if init_prompt_path is None:
+            return prompt_state
+
+        import torch
+
+        checkpoint_path = Path(init_prompt_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Initial prompt checkpoint not found: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        if not isinstance(checkpoint, dict) or "learnable_embeddings" not in checkpoint:
+            raise ValueError(
+                "Initial prompt checkpoint must be a dict containing 'learnable_embeddings'."
+            )
+
+        expected_tokens = len(prompt_state.token_texts)
+        checkpoint_token_texts = tuple(checkpoint.get("token_texts", ()))
+        if checkpoint_token_texts and len(checkpoint_token_texts) != expected_tokens:
+            raise ValueError(
+                "Initial prompt checkpoint token count mismatch: "
+                f"checkpoint has {len(checkpoint_token_texts)}, config expects {expected_tokens}."
+            )
+        if checkpoint_token_texts and checkpoint_token_texts != prompt_state.token_texts:
+            raise ValueError(
+                "Initial prompt checkpoint token texts do not match the current prompt tokens."
+            )
+
+        current_embeddings = prompt_state.learnable_embeddings
+        saved_embeddings = checkpoint["learnable_embeddings"]
+        if not isinstance(current_embeddings, torch.Tensor):
+            raise TypeError("Current prompt embeddings must be a torch.Tensor.")
+        if not isinstance(saved_embeddings, torch.Tensor):
+            raise TypeError("Initial prompt 'learnable_embeddings' must be a torch.Tensor.")
+        if tuple(saved_embeddings.shape) != tuple(current_embeddings.shape):
+            raise ValueError(
+                "Initial prompt embedding shape mismatch: "
+                f"checkpoint has {tuple(saved_embeddings.shape)}, "
+                f"current prompt expects {tuple(current_embeddings.shape)}."
+            )
+
+        loaded_embeddings = torch.nn.Parameter(
+            saved_embeddings.detach()
+            .clone()
+            .to(device=current_embeddings.device, dtype=current_embeddings.dtype)
+        )
+        return replace(prompt_state, learnable_embeddings=loaded_embeddings)
+
     def train_universal_prompt(
         self,
         records: list[ImageRecord],
@@ -663,7 +752,9 @@ class LearnableTokenAttackRunner:
             self.config.attack.objective,
             self.config.attack.lambda_sem,
         )
-        prompt_state = self.create_universal_prompt(components)
+        prompt_state = self._apply_initial_prompt_checkpoint(
+            self.create_universal_prompt(components)
+        )
         learnable_embeddings = prompt_state.learnable_embeddings
         if not isinstance(learnable_embeddings, torch.Tensor):
             raise TypeError("Universal prompt state must expose torch.Tensor learnable embeddings.")
@@ -818,9 +909,12 @@ class LearnableTokenAttackRunner:
             if dist_context.is_rank0:
                 history.append(history_row)
                 set_process_title(
-                    f"prompt_attack uap-train {self.config.output.root.name} "
-                    f"{completed_steps}/{self.config.attack.steps} "
-                    f"asr={history_row['success_rate']:.3f} eta={_format_duration(eta)}"
+                    _compact_process_title(
+                        self.config,
+                        "train",
+                        f"{completed_steps}/{self.config.attack.steps}:"
+                        f"a{history_row['success_rate']:.2f}:e{_format_duration(eta)}",
+                    )
                 )
                 progress.set_postfix(
                     {
@@ -1095,8 +1189,11 @@ class LearnableTokenAttackRunner:
                     asr = success_count / max(seen, 1)
                     clean_asr = clean_success_count / max(clean_correct_count, 1)
                     set_process_title(
-                        f"prompt_attack {stage}-eval {self.config.output.root.name} "
-                        f"{seen}/{len(records)} asr={asr:.3f} eta={_format_duration(eta)}"
+                        _compact_process_title(
+                            self.config,
+                            f"{stage}-eval",
+                            f"{seen}/{len(records)}:a{asr:.2f}:e{_format_duration(eta)}",
+                        )
                     )
                     progress.set_postfix(
                         {

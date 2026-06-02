@@ -21,6 +21,7 @@ def test_load_config() -> None:
     assert config.attack.learnable_token_initializer == "object"
     assert config.attack.learnable_token_init_std == 0.02
     assert config.attack.learnable_token_init_seed == 0
+    assert config.attack.init_prompt_path is None
     assert config.attack.lr_scheduler.name == "cosine"
     assert config.attack.lr_scheduler.warmup_steps == 5
     assert config.attack.lr_scheduler.min_lr == 1.0e-4
@@ -62,6 +63,7 @@ def test_smoke_override_uses_mock() -> None:
     assert smoke.attack.learnable_token_initializer == config.attack.learnable_token_initializer
     assert smoke.attack.learnable_token_init_std == config.attack.learnable_token_init_std
     assert smoke.attack.learnable_token_init_seed == config.attack.learnable_token_init_seed
+    assert smoke.attack.init_prompt_path == config.attack.init_prompt_path
     assert smoke.attack.semantic_loss_weight == config.attack.semantic_loss_weight
     assert smoke.attack.attack_margin == config.attack.attack_margin
     assert smoke.attack.lr_scheduler.name == "cosine"

@@ -12,6 +12,7 @@ from prompt_attack.attacks.losses import (
     is_cr_dino_objective,
     is_cr_objective,
     is_margin_dino_constraint_objective,
+    is_semantic_only_objective,
     negative_cross_entropy_loss,
     untargeted_margin_loss,
     validate_lambda_sem,
@@ -84,11 +85,14 @@ def test_cr_loss_matches_classification_rejection_term() -> None:
     assert is_cr_dino_objective("cr-dino")
     assert is_margin_dino_constraint_objective("margin-dino-constraint")
     assert is_margin_dino_constraint_objective("margin-clip-img2img")
+    assert is_semantic_only_objective("clip-img2img")
+    assert is_semantic_only_objective("dino-img2img")
 
 
 def test_cr_objective_disables_semantic_loss_weight() -> None:
     assert attack_semantic_loss_weights("cr", lambda_sem=0.9) == (1.0, 0.0)
     assert attack_semantic_loss_weights("cr_dino", lambda_sem=0.9) == pytest.approx((0.1, 0.9))
+    assert attack_semantic_loss_weights("clip_img2img", lambda_sem=0.9) == (0.0, 1.0)
 
 
 def test_weighted_attack_semantic_loss_uses_complementary_weights() -> None:
@@ -157,6 +161,48 @@ def test_margin_clip_img2img_loss_uses_same_continuous_similarity_form() -> None
     assert torch.allclose(semantic, torch.tensor([0.25]))
     assert torch.allclose(weighted_semantic, torch.tensor([0.75]))
     assert torch.allclose(total, torch.tensor([0.75]))
+
+
+def test_clip_img2img_loss_has_no_margin_term() -> None:
+    logits = torch.tensor([[10.0, -2.0, 0.0]])
+    labels = torch.tensor([0])
+    clip_similarity = torch.tensor([0.75])
+
+    attack, semantic, weighted_semantic, total = objective_loss_components(
+        logits,
+        labels,
+        "clip_img2img",
+        semantic_similarity=clip_similarity,
+        lambda_sem=0.0,
+        semantic_loss_weight=3.0,
+        attack_margin=0.0,
+    )
+
+    assert torch.allclose(attack, torch.tensor([0.0]))
+    assert torch.allclose(semantic, torch.tensor([0.25]))
+    assert torch.allclose(weighted_semantic, torch.tensor([0.25]))
+    assert torch.allclose(total, weighted_semantic)
+
+
+def test_dino_img2img_loss_has_no_margin_term() -> None:
+    logits = torch.tensor([[10.0, -2.0, 0.0]])
+    labels = torch.tensor([0])
+    dino_similarity = torch.tensor([0.60])
+
+    attack, semantic, weighted_semantic, total = objective_loss_components(
+        logits,
+        labels,
+        "dino_img2img",
+        semantic_similarity=dino_similarity,
+        lambda_sem=0.0,
+        semantic_loss_weight=3.0,
+        attack_margin=0.0,
+    )
+
+    assert torch.allclose(attack, torch.tensor([0.0]))
+    assert torch.allclose(semantic, torch.tensor([0.40]))
+    assert torch.allclose(weighted_semantic, torch.tensor([0.40]))
+    assert torch.allclose(total, weighted_semantic)
 
 
 def test_micro_batch_scaled_loss_matches_global_batch_mean() -> None:

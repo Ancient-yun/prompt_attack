@@ -103,9 +103,30 @@ def is_margin_dino_constraint_objective(objective: str) -> bool:
     }
 
 
+def is_semantic_only_objective(objective: str) -> bool:
+    """Return whether the objective uses only image-to-image semantic loss."""
+    return _normalized_objective(objective) in {
+        "clip",
+        "clip_img2img",
+        "clip_image",
+        "clip_image_to_image",
+        "clip_only",
+        "dino",
+        "dino_img2img",
+        "dino_image",
+        "dino_image_to_image",
+        "dino_only",
+    }
+
+
 def uses_clip_image_similarity(objective: str) -> bool:
     """Return whether the objective expects CLIP image-to-image similarity."""
     return _normalized_objective(objective) in {
+        "clip",
+        "clip_img2img",
+        "clip_image",
+        "clip_image_to_image",
+        "clip_only",
         "margin_clip",
         "margin_clip_img2img",
         "margin_clip_image",
@@ -120,6 +141,11 @@ def uses_dino_similarity(objective: str) -> bool:
         "classification_rejection_dino",
         "classification_rejection_with_dino",
         "cr_dino",
+        "dino",
+        "dino_img2img",
+        "dino_image",
+        "dino_image_to_image",
+        "dino_only",
         "margin_dino",
         "margin_dino_img2img",
         "margin_dino_constraint",
@@ -160,6 +186,8 @@ def attack_semantic_loss_weights(objective: str, lambda_sem: float) -> tuple[flo
     validate_lambda_sem(lambda_sem)
     if is_cr_objective(objective):
         return 1.0, 0.0
+    if is_semantic_only_objective(objective):
+        return 0.0, 1.0
     if is_margin_dino_constraint_objective(objective):
         return 1.0, 1.0
     return 1.0 - lambda_sem, lambda_sem
@@ -188,6 +216,14 @@ def objective_loss_components(
 ) -> tuple[Any, Any, Any, Any]:
     """Return per-sample attack, semantic, weighted-semantic, and total losses."""
     import torch
+
+    if is_semantic_only_objective(objective):
+        if semantic_similarity is None:
+            raise ValueError(f"{objective} requires image-to-image semantic similarity.")
+        semantic_losses = semantic_image_loss(semantic_similarity, reduction="none")
+        attack_losses = torch.zeros_like(semantic_losses)
+        weighted_semantic_losses = semantic_losses
+        return attack_losses, semantic_losses, weighted_semantic_losses, semantic_losses
 
     if is_margin_dino_constraint_objective(objective):
         if semantic_similarity is None:

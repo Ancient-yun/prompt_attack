@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from dataclasses import replace
+import json
 from pathlib import Path
 
 import torch
@@ -146,6 +147,47 @@ def test_clean_correct_filter_reuses_cache(
 
     assert [record.image_id for record in selected] == ["cached_0", "cached_2"]
     assert [record.image_id for record in cached_selected] == ["cached_0", "cached_2"]
+
+
+def test_clean_correct_cache_metadata_contains_version(tmp_path: Path) -> None:
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        data=replace(config.data, imagenet_root=tmp_path, clean_correct_only=True),
+    )
+
+    _, metadata = LearnableTokenAttackRunner(config, device="cpu")._clean_correct_cache_path()
+
+    assert metadata["cache_version"] == runner_module.CLEAN_FILTER_CACHE_VERSION
+    assert metadata["preprocess_signature"] == runner_module.CLEAN_FILTER_PREPROCESS_SIGNATURE
+
+
+def test_clean_correct_cache_ignores_stale_metadata(tmp_path: Path) -> None:
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        data=replace(config.data, imagenet_root=tmp_path, clean_correct_only=True),
+    )
+    runner = LearnableTokenAttackRunner(config, device="cpu")
+    cache_path, metadata = runner._clean_correct_cache_path()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_metadata = dict(metadata)
+    stale_metadata.pop("cache_version")
+    cache_path.write_text(
+        json.dumps(
+            {
+                "metadata": stale_metadata,
+                "checked_keys": ["class/image"],
+                "clean_keys": ["class/image"],
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    checked, clean = runner._load_clean_correct_cache(cache_path, metadata)
+
+    assert checked == set()
+    assert clean == set()
 
 
 def test_clean_correct_filter_allows_uncapped_per_class_selection() -> None:
@@ -391,3 +433,75 @@ def test_universal_prompt_trains_shared_embedding_and_evaluates(tmp_path: Path) 
     assert all(row["training_mode"] == "universal" for row in rows)
     assert all(row["stage"] == "test" for row in rows)
     assert all(row["world_size"] == 1 for row in history)
+
+
+def test_initial_prompt_checkpoint_replaces_universal_embeddings(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "learned_prompt.pt"
+    generator = MockEditableGenerator(device="cpu")
+    values = torch.full((4, generator.embedding_dim), 0.25, dtype=torch.float32)
+    torch.save(
+        {
+            "token_texts": ("<v1>", "<v2>", "<v3>", "<v4>"),
+            "token_ids": (0, 1, 2, 3),
+            "learnable_embeddings": values,
+            "metadata": {"run_name": "source"},
+        },
+        checkpoint_path,
+    )
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        generator=replace(config.generator, name="mock", model_id="mock"),
+        attack=replace(
+            config.attack,
+            num_learnable_tokens=4,
+            init_prompt_path=checkpoint_path,
+        ),
+    )
+    runner = LearnableTokenAttackRunner(config, device="cpu")
+    prompt_state = generator.create_learnable_prompt(
+        class_label="object",
+        num_tokens=4,
+        initializer="object",
+        init_std=0.02,
+    )
+
+    loaded = runner._apply_initial_prompt_checkpoint(prompt_state)
+
+    assert isinstance(loaded.learnable_embeddings, torch.nn.Parameter)
+    assert loaded.learnable_embeddings.requires_grad
+    assert torch.allclose(loaded.learnable_embeddings.detach(), values)
+
+
+def test_initial_prompt_checkpoint_rejects_shape_mismatch(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "learned_prompt.pt"
+    generator = MockEditableGenerator(device="cpu")
+    torch.save(
+        {
+            "token_texts": ("<v1>", "<v2>"),
+            "token_ids": (0, 1),
+            "learnable_embeddings": torch.zeros((2, generator.embedding_dim)),
+            "metadata": {"run_name": "source"},
+        },
+        checkpoint_path,
+    )
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        generator=replace(config.generator, name="mock", model_id="mock"),
+        attack=replace(
+            config.attack,
+            num_learnable_tokens=4,
+            init_prompt_path=checkpoint_path,
+        ),
+    )
+    runner = LearnableTokenAttackRunner(config, device="cpu")
+    prompt_state = generator.create_learnable_prompt(
+        class_label="object",
+        num_tokens=4,
+        initializer="object",
+        init_std=0.02,
+    )
+
+    with pytest.raises(ValueError, match="token count mismatch"):
+        runner._apply_initial_prompt_checkpoint(prompt_state)

@@ -63,6 +63,7 @@ class AttackConfig:
     learnable_token_initializer: str = "object"
     learnable_token_init_std: float = 0.02
     learnable_token_init_seed: int = 0
+    init_prompt_path: Path | None = None
     lr: float = 1.0e-2
     steps: int = 100
     lambda_sem: float = 0.5
@@ -240,6 +241,13 @@ def load_config(path: Path) -> ExperimentConfig:
         use_cpu_offload=bool(generator_raw.get("use_cpu_offload", True)),
         gradient_checkpointing=bool(generator_raw.get("gradient_checkpointing", True)),
     )
+    init_prompt_raw = attack_raw.get("init_prompt_path", attack_raw.get("init_prompt"))
+    init_prompt_path = (
+        None
+        if init_prompt_raw in {None, ""}
+        else Path(os.path.expandvars(str(init_prompt_raw)))
+    )
+
     return ExperimentConfig(
         data=data,
         generator=generator,
@@ -260,6 +268,7 @@ def load_config(path: Path) -> ExperimentConfig:
             ),
             learnable_token_init_std=float(attack_raw.get("learnable_token_init_std", 0.02)),
             learnable_token_init_seed=int(attack_raw.get("learnable_token_init_seed", 0)),
+            init_prompt_path=init_prompt_path,
             lr=float(attack_raw.get("lr", 1.0e-2)),
             steps=int(attack_raw.get("steps", 100)),
             lambda_sem=float(attack_raw.get("lambda_sem", 0.5)),
@@ -358,6 +367,7 @@ def with_smoke_overrides(config: ExperimentConfig, *, use_mock_generator: bool) 
             learnable_token_initializer=config.attack.learnable_token_initializer,
             learnable_token_init_std=config.attack.learnable_token_init_std,
             learnable_token_init_seed=config.attack.learnable_token_init_seed,
+            init_prompt_path=config.attack.init_prompt_path,
             lr=config.attack.lr,
             steps=2,
             lambda_sem=config.attack.lambda_sem,

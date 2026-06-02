@@ -49,8 +49,8 @@ from prompt_attack.utils.wandb_logger import WandbLogger
 
 CLEAN_FILTER_BATCH_SIZE = 512
 CLEAN_FILTER_CACHE_DIR = Path("outputs/cache/clean_correct")
-CLEAN_FILTER_CACHE_VERSION = 2
-CLEAN_FILTER_PREPROCESS_SIGNATURE = "torchvision_weights_transforms_pil_batch_v1"
+CLEAN_FILTER_CACHE_VERSION = 3
+CLEAN_FILTER_PREPROCESS_SIGNATURE = "generator_reference_resize_tensor_v1"
 TRAIN_SHUFFLE_SEED = 0
 
 
@@ -391,14 +391,26 @@ class LearnableTokenAttackRunner:
                 return
             batch = pending
             pending = []
-            images = [load_image(record.path) for record in batch]
             labels = [record.class_index for record in batch]
-            if hasattr(victim, "evaluate_pil_batch"):
-                results = victim.evaluate_pil_batch(images, labels)
+            if hasattr(victim, "logits_from_tensor") and hasattr(victim, "evaluate_logits_batch"):
+                import torch
+
+                loaded = self._load_batch_inputs_cpu(batch)
+                _, original_tensor, true_labels = self._loaded_batch_to_device(loaded)
+                with torch.no_grad():
+                    logits = victim.logits_from_tensor(original_tensor)
+                results = victim.evaluate_logits_batch(
+                    logits,
+                    true_labels.detach().cpu().tolist(),
+                )
             else:
-                results = [
-                    victim.evaluate_pil(image, label) for image, label in zip(images, labels)
-                ]
+                images = [load_image(record.path) for record in batch]
+                if hasattr(victim, "evaluate_pil_batch"):
+                    results = victim.evaluate_pil_batch(images, labels)
+                else:
+                    results = [
+                        victim.evaluate_pil(image, label) for image, label in zip(images, labels)
+                    ]
             for record, result in zip(batch, results):
                 key = record_key(record)
                 checked_keys.add(key)
@@ -445,6 +457,8 @@ class LearnableTokenAttackRunner:
             "class_mode": self.config.data.class_mode,
             "images_per_class": self.config.data.images_per_class,
             "candidate_multiplier": self.config.data.candidate_multiplier,
+            "generator_width": self.config.generator.width,
+            "generator_height": self.config.generator.height,
             "victim_name": self.config.victim.name,
             "victim_weights": self.config.victim.weights,
         }

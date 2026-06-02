@@ -56,6 +56,41 @@ class BatchCleanVictim:
         raise AssertionError("clean-correct filtering should use batched victim evaluation")
 
 
+class TensorCleanVictim:
+    def __init__(self) -> None:
+        self.tensor_shapes: list[tuple[int, ...]] = []
+
+    def logits_from_tensor(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        self.tensor_shapes.append(tuple(image_tensor.shape))
+        logits = torch.zeros((image_tensor.shape[0], 1000), device=image_tensor.device)
+        logits[:, 1] = 1.0
+        return logits
+
+    def evaluate_logits_batch(
+        self,
+        logits: torch.Tensor,
+        true_labels: list[int],
+    ) -> list[ClassificationResult]:
+        del true_labels
+        return [
+            ClassificationResult(
+                pred=int(logits[index].argmax().item()),
+                pred_conf=1.0,
+                true_conf=1.0,
+                margin=1.0,
+            )
+            for index in range(logits.shape[0])
+        ]
+
+    def evaluate_pil_batch(
+        self,
+        images: list[Image.Image],
+        true_labels: list[int],
+    ) -> list[ClassificationResult]:
+        del images, true_labels
+        raise AssertionError("clean-correct filtering should use tensor logits path")
+
+
 def test_clean_correct_filter_skips_victim_when_disabled() -> None:
     config = load_config(Path("configs/flux2_resnet18.yaml"))
     config = replace(
@@ -113,6 +148,40 @@ def test_clean_correct_filter_uses_batched_victim(
 
     assert [record.image_id for record in selected] == ["dummy_0", "dummy_2"]
     assert victim.batch_sizes == [2, 1]
+
+
+def test_clean_correct_filter_uses_eval_tensor_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner_module, "CLEAN_FILTER_BATCH_SIZE", 2)
+    monkeypatch.setattr(runner_module, "CLEAN_FILTER_CACHE_DIR", tmp_path / "cache")
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        data=replace(config.data, clean_correct_only=True, images_per_class=None),
+        generator=replace(config.generator, width=6, height=10),
+    )
+    image_path = tmp_path / "sample.png"
+    Image.new("RGB", (20, 12), color=(128, 128, 128)).save(image_path)
+    records = [
+        ImageRecord(
+            path=image_path,
+            synset="class_0000",
+            class_label="dummy",
+            class_index=1,
+            image_id="dummy",
+        )
+    ]
+    victim = TensorCleanVictim()
+
+    selected = LearnableTokenAttackRunner(config, device="cpu")._clean_correct_records(
+        records,
+        victim,
+    )
+
+    assert [record.image_id for record in selected] == ["dummy"]
+    assert victim.tensor_shapes == [(1, 3, 10, 6)]
 
 
 def test_clean_correct_filter_reuses_cache(

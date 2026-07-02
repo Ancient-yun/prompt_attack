@@ -96,6 +96,8 @@ def _short_objective_label(objective: str) -> str:
         "margin_dino": "mdino",
         "margin_lpips": "mlpips",
         "margin_lpips_img2img": "mlpips",
+        "margin_oracle": "moracle",
+        "margin_oracle_clip": "moracle",
         "cr": "cr",
     }
     return labels.get(normalized, normalized[:10])
@@ -294,7 +296,11 @@ class LearnableTokenAttackRunner:
             checkpoint_path=self.config.victim.checkpoint_path,
             device=self.device,
         )
-        semantic = build_semantic_model(self.config.semantic.name, device=self.device)
+        semantic = build_semantic_model(
+            self.config.semantic.name,
+            device=self.device,
+            class_labels=getattr(victim, "categories", None),
+        )
         dino_metric = None
         if str(getattr(semantic, "metric_name", "")) != "dino_similarity":
             dino_metric = build_semantic_model("dinov2_vitb14", device=self.device)
@@ -868,7 +874,9 @@ class LearnableTokenAttackRunner:
                     raise TypeError("Generator batch result must expose torch.Tensor image_tensor.")
                 logits = components.victim.logits_from_tensor(image_tensor)
                 semantic_sim = (
-                    components.semantic.similarity(original_tensor, image_tensor)
+                    components.semantic.similarity(
+                        original_tensor, image_tensor, labels=true_labels
+                    )
                     if semantic_loss_weight > 0
                     else None
                 )
@@ -1063,7 +1071,9 @@ class LearnableTokenAttackRunner:
                         adv_logits,
                         true_labels.detach().cpu().tolist(),
                     )
-                    semantic_sim = components.semantic.similarity(original_tensor, image_tensor)
+                    semantic_sim = components.semantic.similarity(
+                        original_tensor, image_tensor, labels=true_labels
+                    )
                     dino_metric_sim = (
                         components.dino_metric.similarity(original_tensor, image_tensor)
                         if components.dino_metric is not None

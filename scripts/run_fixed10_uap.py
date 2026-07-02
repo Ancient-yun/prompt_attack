@@ -233,6 +233,8 @@ def process_title(args: argparse.Namespace, stage: str) -> str:
 
 def inferred_semantic_model(objective: str, fallback: str) -> str:
     normalized = objective.lower().replace("-", "_")
+    if "oracle" in normalized:
+        return "clip_oracle"
     if "clip" in normalized:
         return "clip_vit_b32"
     if "lpips" in normalized:

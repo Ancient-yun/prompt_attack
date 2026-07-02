@@ -102,6 +102,8 @@ def is_margin_dino_constraint_objective(objective: str) -> bool:
         "margin_clip_image_to_image",
         "margin_lpips",
         "margin_lpips_img2img",
+        "margin_oracle",
+        "margin_oracle_clip",
     }
 
 

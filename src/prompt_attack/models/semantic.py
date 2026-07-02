@@ -96,11 +96,48 @@ class CLIPImageEncoder:
         return (self.features(left) * self.features(right)).sum(dim=-1)
 
 
-def build_semantic_model(name: str, *, device: str) -> DINOv2Encoder | CLIPImageEncoder:
+class LPIPSSimilarity:
+    """Differentiable LPIPS-based preservation signal.
+
+    Exposes ``similarity(left, right) = 1 - LPIPS(left, right)`` per sample so the shared
+    ``1 - similarity`` semantic loss becomes the LPIPS distance itself. Unlike DINO/CLIP
+    cosine similarity, LPIPS is sensitive to pixel-level structure, so it penalises the
+    fixed adversarial overlay that DINO/CLIP are blind to.
+    """
+
+    metric_name = "lpips_similarity"
+
+    def __init__(self, *, device: str) -> None:
+        import pyiqa
+
+        self.name = "lpips"
+        self.device = device
+        # as_loss=True builds a metric whose forward keeps gradients; we call the wrapped
+        # net directly to get a per-sample distance (the top-level __call__ mean-reduces).
+        self.metric = pyiqa.create_metric("lpips", device=device, as_loss=True)
+        self.net = self.metric.net
+        for param in self.net.parameters():
+            param.requires_grad_(False)
+
+    def similarity(self, left, right):
+        """Return 1 - LPIPS distance between two [0, 1] image tensors, per sample."""
+        if left.ndim == 3:
+            left = left.unsqueeze(0)
+        if right.ndim == 3:
+            right = right.unsqueeze(0)
+        distance = self.net(left, right).reshape(-1)
+        return 1.0 - distance
+
+
+def build_semantic_model(
+    name: str, *, device: str
+) -> DINOv2Encoder | CLIPImageEncoder | LPIPSSimilarity:
     """Build a semantic model by name."""
     normalized = name.lower().replace("-", "_").replace("/", "_")
     if normalized == "dinov2_vitb14":
         return DINOv2Encoder(device=device, model_name="dinov2_vitb14")
+    if normalized in {"lpips", "lpips_alex"}:
+        return LPIPSSimilarity(device=device)
     if normalized in {"clip_vit_b32", "clip_vit_base_patch32", "openai_clip_vit_base_patch32"}:
         return CLIPImageEncoder(device=device, model_id="openai/clip-vit-base-patch32")
     if normalized in {"clip_vit_l14", "clip_vit_large_patch14", "openai_clip_vit_large_patch14"}:

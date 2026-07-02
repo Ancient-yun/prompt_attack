@@ -27,4 +27,3 @@ def stable_image_seed(base_seed: int, image_id: str) -> int:
     for char in image_id:
         value = (value * 131 + ord(char)) % (2**31 - 1)
     return value
-

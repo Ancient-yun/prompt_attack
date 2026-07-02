@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -28,6 +29,9 @@ class ImageRecord:
     class_label: str
     class_index: int
     image_id: str
+    fine_class_label: str | None = None
+    fine_class_index: int | None = None
+    superclass_synset: str | None = None
 
 
 FIXED_10_CLASSES: tuple[FixedClass, ...] = (
@@ -69,7 +73,11 @@ def selected_classes(config: DataConfig) -> tuple[FixedClass, ...]:
 
 def list_class_images(class_dir: Path) -> list[Path]:
     """List image files for one ImageNet synset directory."""
-    images = [p for p in class_dir.iterdir() if p.is_file() and p.suffix in IMAGE_EXTENSIONS]
+    images = [
+        Path(entry.path)
+        for entry in os.scandir(class_dir)
+        if entry.is_file() and Path(entry.name).suffix in IMAGE_EXTENSIONS
+    ]
     return sorted(images)
 
 
@@ -182,6 +190,22 @@ def build_candidate_records(config: DataConfig) -> list[ImageRecord]:
         return build_csv_image_records(config)
     if config.class_mode == "imagenet_folder":
         return build_imagenet_folder_records(config)
+    if config.class_mode in {"mixed_13", "mixed13"}:
+        from prompt_attack.data.superclass import build_superclass_image_records
+
+        if config.imagenet_info_root is None:
+            raise ValueError(
+                "data.imagenet_info_root is required when data.class_mode is mixed_13."
+            )
+        records, _ = build_superclass_image_records(
+            imagenet_root=config.imagenet_root,
+            split=config.split,
+            dataset_name="mixed_13",
+            info_root=config.imagenet_info_root,
+            images_per_superclass=config.images_per_class,
+            candidate_multiplier=config.candidate_multiplier,
+        )
+        return records
     raise ValueError(f"Unsupported class_mode: {config.class_mode}")
 
 

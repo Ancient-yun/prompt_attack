@@ -94,6 +94,8 @@ def _short_objective_label(objective: str) -> str:
         "dino_only": "dino",
         "margin_clip_img2img": "mclip",
         "margin_dino": "mdino",
+        "margin_lpips": "mlpips",
+        "margin_lpips_img2img": "mlpips",
         "cr": "cr",
     }
     return labels.get(normalized, normalized[:10])
@@ -289,6 +291,7 @@ class LearnableTokenAttackRunner:
         victim = build_victim(
             self.config.victim.name,
             weights=self.config.victim.weights,
+            checkpoint_path=self.config.victim.checkpoint_path,
             device=self.device,
         )
         semantic = build_semantic_model(self.config.semantic.name, device=self.device)
@@ -351,8 +354,11 @@ class LearnableTokenAttackRunner:
         per_class: dict[str, int] = defaultdict(int)
         cap = self.config.data.images_per_class
 
+        def selection_class_key(record: ImageRecord) -> str:
+            return record.superclass_synset or record.synset
+
         def can_select(record: ImageRecord) -> bool:
-            return cap is None or per_class[record.synset] < cap
+            return cap is None or per_class[selection_class_key(record)] < cap
 
         if not self.config.data.clean_correct_only:
             for record in tqdm(records, desc="clean-correct filter"):
@@ -361,7 +367,7 @@ class LearnableTokenAttackRunner:
                 if not can_select(record):
                     continue
                 selected.append(record)
-                per_class[record.synset] += 1
+                per_class[selection_class_key(record)] += 1
             return selected
 
         cache_path, cache_metadata = self._clean_correct_cache_path()
@@ -430,7 +436,7 @@ class LearnableTokenAttackRunner:
                     continue
                 if key in clean_keys:
                     selected.append(record)
-                    per_class[record.synset] += 1
+                    per_class[selection_class_key(record)] += 1
             write_cache()
             progress.update(len(batch))
 
@@ -445,7 +451,7 @@ class LearnableTokenAttackRunner:
                 if key in checked_keys:
                     if key in clean_keys:
                         selected.append(record)
-                        per_class[record.synset] += 1
+                        per_class[selection_class_key(record)] += 1
                     progress.update(1)
                     continue
                 pending.append(record)
@@ -469,6 +475,11 @@ class LearnableTokenAttackRunner:
             "generator_height": self.config.generator.height,
             "victim_name": self.config.victim.name,
             "victim_weights": self.config.victim.weights,
+            "victim_checkpoint_path": (
+                None
+                if self.config.victim.checkpoint_path is None
+                else str(self.config.victim.checkpoint_path)
+            ),
         }
         digest = hashlib.sha1(
             json.dumps(metadata, sort_keys=True).encode("utf-8"),
@@ -835,7 +846,16 @@ class LearnableTokenAttackRunner:
                 enabled=True,
             ):
                 prompt_batch = self._shared_prompt_batch(prompt_state, micro_batch)
-                seeds = [stable_image_seed(0, record.image_id) for record in micro_batch]
+                if self.config.attack.eot_train_seeds:
+                    # Expectation over Transformation: resample the diffusion trajectory
+                    # each step so the token cannot memorise one deterministic path into a
+                    # fixed overlay. A step-dependent base keeps each image's seed distinct
+                    # yet reproducible.
+                    seeds = [
+                        stable_image_seed(step + 1, record.image_id) for record in micro_batch
+                    ]
+                else:
+                    seeds = [stable_image_seed(0, record.image_id) for record in micro_batch]
                 generated = components.generator.generate_batch(
                     input_images=images,
                     input_tensor=original_tensor,

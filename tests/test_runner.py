@@ -284,6 +284,42 @@ def test_clean_correct_filter_allows_uncapped_per_class_selection() -> None:
     assert selected == records
 
 
+def test_clean_correct_filter_caps_by_superclass_when_available() -> None:
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        data=replace(config.data, clean_correct_only=False, images_per_class=2),
+    )
+    records = [
+        ImageRecord(
+            path=Path(f"does-not-exist-{index}.png"),
+            synset=f"fine_{index:04d}",
+            class_label="super a",
+            class_index=0,
+            image_id=f"a_{index}",
+            superclass_synset="super_a",
+        )
+        for index in range(3)
+    ] + [
+        ImageRecord(
+            path=Path(f"does-not-exist-b-{index}.png"),
+            synset=f"fine_b_{index:04d}",
+            class_label="super b",
+            class_index=1,
+            image_id=f"b_{index}",
+            superclass_synset="super_b",
+        )
+        for index in range(2)
+    ]
+
+    selected = LearnableTokenAttackRunner(config, device="cpu")._clean_correct_records(
+        records,
+        RaisingVictim(),
+    )
+
+    assert [record.image_id for record in selected] == ["a_0", "a_1", "b_0", "b_1"]
+
+
 def test_universal_train_batches_shuffle_deterministically_each_epoch() -> None:
     config = load_config(Path("configs/flux2_resnet18.yaml"))
     runner = LearnableTokenAttackRunner(config, device="cpu")

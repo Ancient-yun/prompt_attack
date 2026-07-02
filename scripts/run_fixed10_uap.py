@@ -22,6 +22,7 @@ from prompt_attack.config import (
     OutputConfig,
     QualityConfig,
     SemanticConfig,
+    VictimConfig,
     WandbConfig,
     load_config,
     parse_images_per_class,
@@ -43,6 +44,11 @@ def parse_args() -> argparse.Namespace:
         help="Override the generated output folder name with a concise explicit name.",
     )
     parser.add_argument("--imagenet-root", type=Path)
+    parser.add_argument("--imagenet-info-root", type=Path)
+    parser.add_argument("--class-mode", default="fixed_10")
+    parser.add_argument("--victim-name")
+    parser.add_argument("--victim-weights")
+    parser.add_argument("--victim-checkpoint", type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--train-images-per-class", default="10")
     parser.add_argument("--test-images-per-class", default="10")
@@ -70,7 +76,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--objective", default="cr")
     parser.add_argument(
         "--semantic-model",
-        help="Semantic image encoder. Defaults to CLIP for margin_clip_img2img, DINO otherwise.",
+        help="Semantic image encoder. Defaults to CLIP for *clip* objectives, LPIPS for "
+        "*lpips* objectives, DINO otherwise.",
+    )
+    parser.add_argument(
+        "--eot",
+        action="store_true",
+        help="Expectation over Transformation: resample the generation seed every train "
+        "step so the token cannot memorise a fixed overlay.",
     )
     parser.add_argument("--learnable-token-initializer", default="object")
     parser.add_argument("--learnable-token-init-seed", type=int, default=0)
@@ -168,12 +181,13 @@ def run_name(args: argparse.Namespace, *, train_ipc: int | None, test_ipc: int |
         return args.run_name
     train_label = images_per_class_label(train_ipc)
     test_label = images_per_class_label(test_ipc)
+    class_mode_label = args.class_mode.lower().replace("-", "_")
     objective_label = args.objective.lower().replace("-", "_")
     lambda_label = f"{args.lambda_sem:g}".replace(".", "p")
     semantic_weight_label = f"{args.semantic_loss_weight:g}".replace(".", "p")
     initializer_label = args.learnable_token_initializer.lower().replace("-", "_").replace(" ", "_")
     return (
-        f"uap_fixed10_train{train_label}_test{test_label}_"
+        f"uap_{class_mode_label}_train{train_label}_test{test_label}_"
         f"gb{global_batch_size(args)}_gbs{args.generator_batch_size}_"
         f"epochs{args.epochs}_nis{args.num_inference_steps}_tokens{args.num_tokens}_"
         f"{objective_label}_init{initializer_label}_lam{lambda_label}_semw{semantic_weight_label}"
@@ -221,6 +235,8 @@ def inferred_semantic_model(objective: str, fallback: str) -> str:
     normalized = objective.lower().replace("-", "_")
     if "clip" in normalized:
         return "clip_vit_b32"
+    if "lpips" in normalized:
+        return "lpips"
     return fallback
 
 
@@ -262,6 +278,10 @@ def build_stage_config(
     base = load_config(args.config)
     wandb = base.logging.wandb
     imagenet_root = args.imagenet_root or base.data.imagenet_root
+    imagenet_info_root = args.imagenet_info_root or base.data.imagenet_info_root
+    victim_name = args.victim_name or base.victim.name
+    victim_weights = args.victim_weights or base.victim.weights
+    victim_checkpoint = args.victim_checkpoint or base.victim.checkpoint_path
     semantic_name = args.semantic_model or inferred_semantic_model(
         args.objective, base.semantic.name
     )
@@ -269,11 +289,17 @@ def build_stage_config(
         base,
         data=DataConfig(
             imagenet_root=imagenet_root,
+            imagenet_info_root=imagenet_info_root,
             split=split,
-            class_mode="fixed_10",
+            class_mode=args.class_mode,
             images_per_class=images_per_class,
             clean_correct_only=not args.include_clean_incorrect,
             candidate_multiplier=base.data.candidate_multiplier,
+        ),
+        victim=VictimConfig(
+            name=victim_name,
+            weights=victim_weights,
+            checkpoint_path=victim_checkpoint,
         ),
         semantic=SemanticConfig(
             name=semantic_name,
@@ -294,6 +320,7 @@ def build_stage_config(
             semantic_loss_weight=args.semantic_loss_weight,
             attack_margin=args.attack_margin,
             objective=args.objective,
+            eot_train_seeds=args.eot,
         ),
         output=OutputConfig(
             root=output_root,
@@ -321,8 +348,9 @@ def build_stage_config(
                 dir=wandb.dir,
                 tags=(
                     "uap",
-                    "fixed-10",
+                    args.class_mode,
                     "universal",
+                    victim_name,
                     "ddp" if int(os.environ.get("WORLD_SIZE", "1")) > 1 else "single-gpu",
                     f"train-{images_per_class_label(images_per_class)}",
                     f"batch-size-{global_batch_size(args)}",
@@ -397,6 +425,11 @@ def print_run_overview(
     rows = [
         ("run", name),
         ("output", output_root),
+        ("class mode", args.class_mode),
+        ("victim", args.victim_name or "config default"),
+        ("victim checkpoint", args.victim_checkpoint or "config/default"),
+        ("imagenet root", args.imagenet_root or "config default"),
+        ("imagenet info root", args.imagenet_info_root or "config/default"),
         ("train records", train_records),
         ("test records", test_records),
         ("clean-correct only", not args.include_clean_incorrect),
@@ -437,7 +470,7 @@ def print_run_overview(
         ("test csv", metrics_dir / "test_results.csv"),
         ("summary json", metrics_dir / "summary.json"),
     ]
-    terminal_kv("Fixed10 UAP Run Overview", rows)
+    terminal_kv("UAP Run Overview", rows)
     print(
         "\nProgress lines show step/batch, percent, ASR, elapsed time, and ETA. "
         "In tmux, keep this pane open or tail the log file.",
@@ -501,10 +534,11 @@ def main() -> None:
         os.environ["WANDB_PROJECT"] = args.wandb_project
         os.environ["WANDB_MODE"] = args.wandb_mode
         terminal_kv(
-            "Fixed10 UAP Startup",
+            "UAP Startup",
             [
                 ("run", name),
                 ("output", output_root),
+                ("class mode", args.class_mode),
                 ("rank", dist_context.rank),
                 ("world size", dist_context.world_size),
                 ("device", dist_context.device),
@@ -672,6 +706,14 @@ def main() -> None:
                 "epochs": args.epochs,
                 "global_batch_size": global_batch_size(args),
                 "generator_batch_size": args.generator_batch_size,
+                "class_mode": args.class_mode,
+                "victim_name": train_config.victim.name,
+                "victim_weights": train_config.victim.weights,
+                "victim_checkpoint_path": (
+                    None
+                    if train_config.victim.checkpoint_path is None
+                    else str(train_config.victim.checkpoint_path)
+                ),
                 "objective": args.objective,
                 "semantic_model": train_config.semantic.name,
                 "learnable_token_initializer": args.learnable_token_initializer,
@@ -697,6 +739,14 @@ def main() -> None:
                     "world_size": dist_context.world_size,
                     "train_split": "train",
                     "test_split": "val",
+                    "class_mode": args.class_mode,
+                    "victim_name": train_config.victim.name,
+                    "victim_weights": train_config.victim.weights,
+                    "victim_checkpoint_path": (
+                        None
+                        if train_config.victim.checkpoint_path is None
+                        else str(train_config.victim.checkpoint_path)
+                    ),
                     "train_record_count": len(train_records),
                     "test_record_count": len(test_records),
                     "steps": steps,

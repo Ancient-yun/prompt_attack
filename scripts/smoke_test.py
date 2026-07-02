@@ -31,7 +31,12 @@ def main() -> None:
     config = with_smoke_overrides(load_config(args.config), use_mock_generator=not args.real_generator)
 
     if args.imports_only:
-        build_victim(config.victim.name, weights=config.victim.weights, device=args.device)
+        build_victim(
+            config.victim.name,
+            weights=config.victim.weights,
+            checkpoint_path=config.victim.checkpoint_path,
+            device=args.device,
+        )
         build_semantic_model(config.semantic.name, device=args.device)
         build_generator(config.generator, device=args.device)
         print("imports-ok")

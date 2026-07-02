@@ -13,6 +13,7 @@ import yaml
 @dataclass(frozen=True)
 class DataConfig:
     imagenet_root: Path
+    imagenet_info_root: Path | None = None
     split: str = "val"
     class_mode: str = "fixed_10"
     images_per_class: int | None = 20
@@ -40,6 +41,7 @@ class GeneratorConfig:
 class VictimConfig:
     name: str = "resnet50"
     weights: str = "IMAGENET1K_V2"
+    checkpoint_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ class AttackConfig:
     semantic_loss_weight: float = 10.0
     attack_margin: float = 0.0
     objective: str = "untargeted_margin"
+    eot_train_seeds: bool = False
     lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
 
 
@@ -219,8 +222,14 @@ def load_config(path: Path) -> ExperimentConfig:
 
     split_raw = data_raw.get("split", "val")
     imagenet_root_raw = os.environ.get("PROMPT_ATTACK_IMAGENET_ROOT", data_raw["imagenet_root"])
+    imagenet_info_root_raw = data_raw.get("imagenet_info_root", data_raw.get("info_root"))
     data = DataConfig(
         imagenet_root=Path(os.path.expandvars(str(imagenet_root_raw))),
+        imagenet_info_root=(
+            None
+            if imagenet_info_root_raw in {None, ""}
+            else Path(os.path.expandvars(str(imagenet_info_root_raw)))
+        ),
         split="" if split_raw in {None, ""} else str(split_raw),
         class_mode=str(data_raw.get("class_mode", "fixed_10")),
         images_per_class=parse_images_per_class(data_raw.get("images_per_class", 20)),
@@ -254,6 +263,11 @@ def load_config(path: Path) -> ExperimentConfig:
         victim=VictimConfig(
             name=str(victim_raw.get("name", "resnet50")),
             weights=str(victim_raw.get("weights", "IMAGENET1K_V2")),
+            checkpoint_path=(
+                None
+                if victim_raw.get("checkpoint_path") in {None, ""}
+                else Path(os.path.expandvars(str(victim_raw.get("checkpoint_path"))))
+            ),
         ),
         semantic=SemanticConfig(
             name=str(semantic_raw.get("name", "dinov2_vitb14")),
@@ -280,6 +294,7 @@ def load_config(path: Path) -> ExperimentConfig:
             ),
             attack_margin=float(attack_raw.get("attack_margin", 0.0)),
             objective=str(attack_raw.get("objective", "untargeted_margin")),
+            eot_train_seeds=bool(attack_raw.get("eot_train_seeds", False)),
             lr_scheduler=LRSchedulerConfig(
                 name=str(lr_scheduler_raw.get("name", "fixed")),
                 warmup_steps=max(0, int(lr_scheduler_raw.get("warmup_steps", 0))),
@@ -351,6 +366,7 @@ def with_smoke_overrides(config: ExperimentConfig, *, use_mock_generator: bool) 
     return ExperimentConfig(
         data=DataConfig(
             imagenet_root=config.data.imagenet_root,
+            imagenet_info_root=config.data.imagenet_info_root,
             split=config.data.split,
             class_mode=config.data.class_mode,
             images_per_class=2,
@@ -374,6 +390,7 @@ def with_smoke_overrides(config: ExperimentConfig, *, use_mock_generator: bool) 
             semantic_loss_weight=config.attack.semantic_loss_weight,
             attack_margin=config.attack.attack_margin,
             objective=config.attack.objective,
+            eot_train_seeds=config.attack.eot_train_seeds,
             lr_scheduler=config.attack.lr_scheduler,
         ),
         quality=QualityConfig(

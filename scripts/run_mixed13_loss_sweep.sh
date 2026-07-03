@@ -39,7 +39,7 @@ run_one() {
   fi
 
   echo "==== START ${name} $(date -Is) ====" | tee -a "${SWEEP_LOG}"
-  python scripts/run_fixed10_uap.py "${BASE_ARGS[@]}" --run-name "${name}" "$@" >"${log_path}" 2>&1
+  python scripts/run_uap.py "${BASE_ARGS[@]}" --run-name "${name}" "$@" >"${log_path}" 2>&1
   echo "==== DONE ${name} $(date -Is) ====" | tee -a "${SWEEP_LOG}"
 }
 

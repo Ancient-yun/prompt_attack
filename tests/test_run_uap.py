@@ -5,9 +5,9 @@ from pathlib import Path
 import torch
 
 
-def _load_run_fixed10_uap_module():
-    path = Path("scripts/run_fixed10_uap.py")
-    spec = importlib.util.spec_from_file_location("run_fixed10_uap", path)
+def _load_run_uap_module():
+    path = Path("scripts/run_uap.py")
+    spec = importlib.util.spec_from_file_location("run_uap", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not import {path}")
     module = importlib.util.module_from_spec(spec)
@@ -15,13 +15,13 @@ def _load_run_fixed10_uap_module():
     return module
 
 
-run_fixed10_uap = _load_run_fixed10_uap_module()
+run_uap = _load_run_uap_module()
 
 
 def test_run_name_uses_explicit_override() -> None:
     args = Namespace(run_name="local_clip_t32_e2_gb16")
 
-    assert run_fixed10_uap.run_name(args, train_ipc=None, test_ipc=None) == "local_clip_t32_e2_gb16"
+    assert run_uap.run_name(args, train_ipc=None, test_ipc=None) == "local_clip_t32_e2_gb16"
 
 
 def test_continuation_metadata_reads_source_prompt(tmp_path: Path) -> None:
@@ -35,7 +35,7 @@ def test_continuation_metadata_reads_source_prompt(tmp_path: Path) -> None:
     )
     args = Namespace(init_prompt=prompt_path, base_epochs=1, epochs=1)
 
-    metadata = run_fixed10_uap.continuation_metadata(args)
+    metadata = run_uap.continuation_metadata(args)
 
     assert metadata["init_prompt_path"] == str(prompt_path)
     assert metadata["base_epochs"] == 1
@@ -96,7 +96,7 @@ def test_build_stage_config_accepts_mixed13_checkpoint(tmp_path: Path) -> None:
         legitimacy_semantic_threshold=None,
     )
 
-    config = run_fixed10_uap.build_stage_config(
+    config = run_uap.build_stage_config(
         args,
         split="train",
         images_per_class=1,
@@ -164,7 +164,7 @@ def test_build_stage_config_threads_strength_schedule_args(tmp_path: Path) -> No
         legitimacy_semantic_threshold=0.6,
     )
 
-    config = run_fixed10_uap.build_stage_config(
+    config = run_uap.build_stage_config(
         args,
         split="train",
         images_per_class=1,
@@ -200,6 +200,6 @@ def test_run_name_appends_axis_suffix_when_strength_schedule_enabled() -> None:
         num_anchor_tokens=None,
     )
 
-    name = run_fixed10_uap.run_name(args, train_ipc=20, test_ipc=20)
+    name = run_uap.run_name(args, train_ipc=20, test_ipc=20)
 
     assert name.endswith("_axis4v4")

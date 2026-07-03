@@ -48,7 +48,7 @@ run_one() {
   fi
 
   echo "==== START ${target_name} from ${source_name} $(date -Is) ====" | tee -a "${SWEEP_LOG}"
-  python scripts/run_fixed10_uap.py \
+  python scripts/run_uap.py \
     "${BASE_ARGS[@]}" \
     --init-prompt "${source_prompt}" \
     --run-name "${target_name}" \

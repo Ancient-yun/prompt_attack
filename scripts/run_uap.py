@@ -1,4 +1,4 @@
-"""Train and evaluate a fixed-10-class universal learnable-token prompt."""
+"""Train and evaluate a universal learnable-token prompt (any --class-mode, e.g. fixed_10/mixed_13)."""
 
 from __future__ import annotations
 

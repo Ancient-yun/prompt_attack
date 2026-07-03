@@ -29,6 +29,6 @@ for tokens in 16 32 64; do
     UV_LINK_MODE=copy \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     WANDB_MODE=online \
-    uv run python scripts/run_fixed10_uap.py "${COMMON_ARGS[@]}" --num-tokens "${tokens}"
+    uv run python scripts/run_uap.py "${COMMON_ARGS[@]}" --num-tokens "${tokens}"
   echo "==== DONE tokens=${tokens} objective=cr_dino lambda_sem=0.5 ===="
 done

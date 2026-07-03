@@ -5,7 +5,7 @@
 # ~4.5h full e5 run. Expected wall-clock: ~15 minutes.
 set -euo pipefail
 
-python scripts/run_fixed10_uap.py \
+python scripts/run_uap.py \
   --root outputs/uap_mixed13 \
   --imagenet-root /data/ImageNet/2012 \
   --imagenet-info-root external/imagenet_hierarchy_wordnet \

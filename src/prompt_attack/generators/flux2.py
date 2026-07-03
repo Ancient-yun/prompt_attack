@@ -270,6 +270,8 @@ class Flux2Adapter:
 
     def sync_axis_prompt(self, state: "AxisPromptState", *, t: float = 1.0) -> None:
         """Synchronize generator-owned token rows for an axis prompt at strength ``t``."""
+        from prompt_attack.attacks.axis_tokens import embeddings_at
+
         temp_prompt = LearnablePrompt(
             prompt_text="",
             token_texts=state.token_texts,

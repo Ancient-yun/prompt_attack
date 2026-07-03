@@ -51,6 +51,47 @@ class MockEditableGenerator:
             learnable_embeddings=torch.nn.Parameter(values),
         )
 
+    def create_axis_prompt(
+        self,
+        *,
+        class_label: str,
+        num_tokens: int,
+        num_anchor_tokens: int,
+        initializer: str,
+        init_std: float,
+        init_seed: int = 0,
+    ) -> "AxisPromptState":
+        """Create mock anchor/axis token embeddings for smoke tests."""
+        import torch
+
+        from prompt_attack.attacks.axis_tokens import AxisPromptState
+
+        del class_label  # universal attacks share one class-agnostic token set
+        validate_token_init_std(init_std)
+        token_texts = build_token_texts(num_tokens)
+        full_initial = self._initial_values(
+            initializer=initializer,
+            shape=(num_tokens, self.embedding_dim),
+            init_std=init_std,
+            init_seed=init_seed,
+        )
+        anchor_values = full_initial[:num_anchor_tokens].clone()
+        axis_base_values = full_initial[num_anchor_tokens:].clone().detach()
+        axis_direction_values = torch.zeros_like(axis_base_values)
+        return AxisPromptState(
+            token_texts=token_texts,
+            token_ids=tuple(range(num_tokens)),
+            num_anchor_tokens=num_anchor_tokens,
+            num_axis_tokens=num_tokens - num_anchor_tokens,
+            anchor_embeddings=torch.nn.Parameter(anchor_values),
+            axis_base=axis_base_values,
+            axis_direction=torch.nn.Parameter(axis_direction_values),
+        )
+
+    def sync_axis_prompt(self, state: "AxisPromptState", *, t: float = 1.0) -> None:
+        """Mock generator has no embedding table to synchronize."""
+        del state, t
+
     def create_learnable_prompt_batch(
         self,
         *,

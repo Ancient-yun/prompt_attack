@@ -129,7 +129,42 @@ def parse_args() -> argparse.Namespace:
         help="Save qualitative grids for representative rows, every row, or no rows.",
     )
     parser.add_argument("--max-saved-grids", type=int, default=48)
+    parser.add_argument(
+        "--strength-schedule",
+        action="store_true",
+        help="Enable a MAELS-inspired anchor/axis token split with a t-strength sweep, "
+        "instead of optimizing a single fixed-strength token.",
+    )
+    parser.add_argument(
+        "--num-anchor-tokens",
+        type=int,
+        help="Identity-preserving anchor tokens out of --num-tokens. Default: ceil(num_tokens/2).",
+    )
+    parser.add_argument(
+        "--axis-lr",
+        type=float,
+        help="Learning rate for the axis-direction param group. Default: same as --lr.",
+    )
+    parser.add_argument(
+        "--train-strengths",
+        type=_parse_float_list,
+        default="0.2,0.6,1.0",
+        help="Comma-separated strengths sampled along the axis direction each train step.",
+    )
+    parser.add_argument(
+        "--eval-strengths",
+        type=_parse_float_list,
+        default="0.1,0.3,0.5,0.7,1.0",
+        help="Comma-separated strengths swept along the axis direction at eval time.",
+    )
+    parser.add_argument("--legitimacy-ssim-threshold", type=float, default=0.5)
+    parser.add_argument("--legitimacy-semantic-threshold", type=float)
     return parser.parse_args()
+
+
+def _parse_float_list(value: str) -> tuple[float, ...]:
+    """Parse a comma-separated list of floats from a CLI argument."""
+    return tuple(float(item.strip()) for item in value.split(",") if item.strip())
 
 
 def images_per_class_label(value: int | None) -> str:
@@ -186,12 +221,21 @@ def run_name(args: argparse.Namespace, *, train_ipc: int | None, test_ipc: int |
     lambda_label = f"{args.lambda_sem:g}".replace(".", "p")
     semantic_weight_label = f"{args.semantic_loss_weight:g}".replace(".", "p")
     initializer_label = args.learnable_token_initializer.lower().replace("-", "_").replace(" ", "_")
-    return (
+    base_name = (
         f"uap_{class_mode_label}_train{train_label}_test{test_label}_"
         f"gb{global_batch_size(args)}_gbs{args.generator_batch_size}_"
         f"epochs{args.epochs}_nis{args.num_inference_steps}_tokens{args.num_tokens}_"
         f"{objective_label}_init{initializer_label}_lam{lambda_label}_semw{semantic_weight_label}"
     )
+    if args.strength_schedule:
+        num_anchor = (
+            args.num_anchor_tokens
+            if args.num_anchor_tokens is not None
+            else math.ceil(args.num_tokens / 2)
+        )
+        num_axis = args.num_tokens - num_anchor
+        base_name += f"_axis{num_anchor}v{num_axis}"
+    return base_name
 
 
 def short_objective_label(objective: str) -> str:
@@ -323,6 +367,13 @@ def build_stage_config(
             attack_margin=args.attack_margin,
             objective=args.objective,
             eot_train_seeds=args.eot,
+            strength_schedule=args.strength_schedule,
+            num_anchor_tokens=args.num_anchor_tokens,
+            axis_lr=args.axis_lr,
+            train_strengths=args.train_strengths,
+            eval_strengths=args.eval_strengths,
+            legitimacy_ssim_threshold=args.legitimacy_ssim_threshold,
+            legitimacy_semantic_threshold=args.legitimacy_semantic_threshold,
         ),
         output=OutputConfig(
             root=output_root,
@@ -447,6 +498,19 @@ def print_run_overview(
             args.semantic_model or inferred_semantic_model(args.objective, "dinov2_vitb14"),
         ),
         ("semantic loss weight", args.semantic_loss_weight),
+        ("strength schedule", args.strength_schedule),
+        *(
+            [
+                ("num anchor tokens", args.num_anchor_tokens or f"ceil({args.num_tokens}/2)"),
+                ("axis lr", args.axis_lr or args.lr),
+                ("train strengths", args.train_strengths),
+                ("eval strengths", args.eval_strengths),
+                ("legitimacy ssim threshold", args.legitimacy_ssim_threshold),
+                ("legitimacy semantic threshold", args.legitimacy_semantic_threshold or "off"),
+            ]
+            if args.strength_schedule
+            else []
+        ),
         ("train updates", steps),
         ("global batch", global_batch_size(args)),
         ("generator batch", args.generator_batch_size),
@@ -611,11 +675,19 @@ def main() -> None:
     started = time.perf_counter()
     if logger is not None:
         logger.start()
+    train_fn = (
+        train_runner.train_universal_axis_prompt
+        if args.strength_schedule
+        else train_runner.train_universal_prompt
+    )
+    evaluate_fn_name = (
+        "evaluate_universal_axis_prompt" if args.strength_schedule else "evaluate_universal_prompt"
+    )
     try:
         if dist_context.is_rank0:
             terminal_stage(2, stage_total, "train shared learnable-token prompt")
             set_process_title(process_title(args, "train"))
-        prompt_state, history = train_runner.train_universal_prompt(
+        prompt_state, history = train_fn(
             train_records,
             components,
             logger=logger,
@@ -632,7 +704,7 @@ def main() -> None:
                 if dist_context.is_distributed
                 else metrics_dir / "train_results.csv"
             )
-            train_rows = train_runner.evaluate_universal_prompt(
+            train_rows = getattr(train_runner, evaluate_fn_name)(
                 dist_context.shard(train_records),
                 components,
                 prompt_state,
@@ -651,7 +723,7 @@ def main() -> None:
             if dist_context.is_distributed
             else metrics_dir / "test_results.csv"
         )
-        test_rows = test_runner.evaluate_universal_prompt(
+        test_rows = getattr(test_runner, evaluate_fn_name)(
             dist_context.shard(test_records),
             components,
             prompt_state,
@@ -727,6 +799,20 @@ def main() -> None:
                 "image_format": args.image_format,
                 "grid_save_policy": args.grid_save_policy,
                 "max_saved_grids": args.max_saved_grids,
+                "strength_schedule": args.strength_schedule,
+                **(
+                    {
+                        "num_anchor_tokens": args.num_anchor_tokens
+                        or math.ceil(args.num_tokens / 2),
+                        "axis_lr": args.axis_lr or args.lr,
+                        "train_strengths": list(args.train_strengths),
+                        "eval_strengths": list(args.eval_strengths),
+                        "legitimacy_ssim_threshold": args.legitimacy_ssim_threshold,
+                        "legitimacy_semantic_threshold": args.legitimacy_semantic_threshold,
+                    }
+                    if args.strength_schedule
+                    else {}
+                ),
                 **prompt_continuation_metadata,
                 "train": train_summary,
                 "test": test_summary,

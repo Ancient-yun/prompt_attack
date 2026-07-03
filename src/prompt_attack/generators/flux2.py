@@ -227,6 +227,57 @@ class Flux2Adapter:
         self.sync_learnable_prompt(prompt_state)
         return prompt_state
 
+    def create_axis_prompt(
+        self,
+        *,
+        class_label: str,
+        num_tokens: int,
+        num_anchor_tokens: int,
+        initializer: str,
+        init_std: float,
+        init_seed: int = 0,
+    ) -> "AxisPromptState":
+        """Create anchor/axis textual-inversion tokens for a strength-scheduled attack."""
+        import torch
+
+        from prompt_attack.attacks.axis_tokens import AxisPromptState, embeddings_at
+
+        del class_label  # universal attacks share one class-agnostic token set
+        validate_token_init_std(init_std)
+        token_texts = build_token_texts(num_tokens)
+        token_ids = self._ensure_learnable_tokens(token_texts)
+        full_initial = self._initial_values(
+            initializer=initializer,
+            num_tokens=num_tokens,
+            token_ids=token_ids,
+            init_std=init_std,
+            init_seed=init_seed,
+        )
+        anchor_values = full_initial[:num_anchor_tokens].clone()
+        axis_base_values = full_initial[num_anchor_tokens:].clone().detach()
+        axis_direction_values = torch.zeros_like(axis_base_values)
+        state = AxisPromptState(
+            token_texts=token_texts,
+            token_ids=token_ids,
+            num_anchor_tokens=num_anchor_tokens,
+            num_axis_tokens=num_tokens - num_anchor_tokens,
+            anchor_embeddings=torch.nn.Parameter(anchor_values),
+            axis_base=axis_base_values,
+            axis_direction=torch.nn.Parameter(axis_direction_values),
+        )
+        self.sync_axis_prompt(state, t=1.0)
+        return state
+
+    def sync_axis_prompt(self, state: "AxisPromptState", *, t: float = 1.0) -> None:
+        """Synchronize generator-owned token rows for an axis prompt at strength ``t``."""
+        temp_prompt = LearnablePrompt(
+            prompt_text="",
+            token_texts=state.token_texts,
+            token_ids=state.token_ids,
+            learnable_embeddings=embeddings_at(state, t),
+        )
+        self.sync_learnable_prompt(temp_prompt)
+
     def create_learnable_prompt_batch(
         self,
         *,

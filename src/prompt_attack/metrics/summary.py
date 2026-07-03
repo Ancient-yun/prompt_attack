@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
@@ -29,6 +30,9 @@ class MetricSummary:
     mean_iqa_tres: float | None
     fid: float | None
     mean_runtime_seconds: float
+    sp_asr: float | None = None
+    mean_first_success_strength: float | None = None
+    median_first_success_strength: float | None = None
 
 
 def _mean_optional(rows: Sequence[Mapping[str, object]], key: str) -> float | None:
@@ -85,6 +89,26 @@ def summarize_rows(rows: Sequence[Mapping[str, object]], *, fid: float | None = 
     pixel_l2_mean = [float(cast(Any, row["pixel_l2_mean"])) for row in rows]
     pixel_linf = [float(cast(Any, row["pixel_linf"])) for row in rows]
     runtime = [float(cast(Any, row["runtime_seconds"])) for row in rows]
+    sp_rows = [row for row in rows if "sp_success" in row]
+    sp_asr = (
+        sum(1 for row in sp_rows if _as_bool(row["sp_success"])) / len(sp_rows)
+        if sp_rows
+        else None
+    )
+    first_success_strengths = sorted(
+        float(cast(Any, row["sp_first_success_strength"]))
+        for row in sp_rows
+        if _as_bool(row.get("sp_success", False))
+        and row.get("sp_first_success_strength") not in {None, ""}
+    )
+    mean_first_success_strength = (
+        sum(first_success_strengths) / len(first_success_strengths)
+        if first_success_strengths
+        else None
+    )
+    median_first_success_strength = (
+        statistics.median(first_success_strengths) if first_success_strengths else None
+    )
     return MetricSummary(
         count=len(rows),
         success_count=success_count,
@@ -106,4 +130,7 @@ def summarize_rows(rows: Sequence[Mapping[str, object]], *, fid: float | None = 
         mean_iqa_tres=_mean_optional(rows, "iqa_tres"),
         fid=fid,
         mean_runtime_seconds=sum(runtime) / len(runtime),
+        sp_asr=sp_asr,
+        mean_first_success_strength=mean_first_success_strength,
+        median_first_success_strength=median_first_success_strength,
     )

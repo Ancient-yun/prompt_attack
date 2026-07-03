@@ -86,6 +86,14 @@ def test_build_stage_config_accepts_mixed13_checkpoint(tmp_path: Path) -> None:
         image_format="png",
         image_quality=95,
         image_save_workers=1,
+        eot=False,
+        strength_schedule=False,
+        num_anchor_tokens=None,
+        axis_lr=None,
+        train_strengths=(0.2, 0.6, 1.0),
+        eval_strengths=(0.1, 0.3, 0.5, 0.7, 1.0),
+        legitimacy_ssim_threshold=0.5,
+        legitimacy_semantic_threshold=None,
     )
 
     config = run_fixed10_uap.build_stage_config(
@@ -102,3 +110,96 @@ def test_build_stage_config_accepts_mixed13_checkpoint(tmp_path: Path) -> None:
     assert config.data.imagenet_info_root == info_root
     assert config.victim.name == "resnet18_mixed13"
     assert config.victim.checkpoint_path == checkpoint
+    assert config.attack.strength_schedule is False
+
+
+def test_build_stage_config_threads_strength_schedule_args(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "best.pt"
+    info_root = tmp_path / "imagenet_info"
+    imagenet_root = tmp_path / "imagenet"
+    args = Namespace(
+        config=Path("configs/flux2_resnet18.yaml"),
+        imagenet_root=imagenet_root,
+        imagenet_info_root=info_root,
+        class_mode="mixed_13",
+        victim_name="resnet18_mixed13",
+        victim_weights=None,
+        victim_checkpoint=checkpoint,
+        global_batch_size=2,
+        attack_batch_size=None,
+        generator="mock",
+        generator_batch_size=2,
+        height=224,
+        width=224,
+        num_inference_steps=1,
+        semantic_model=None,
+        objective="margin_lpips",
+        include_clean_incorrect=False,
+        num_tokens=8,
+        learnable_token_initializer="object",
+        learnable_token_init_seed=0,
+        init_prompt=None,
+        lr=0.1,
+        epochs=1,
+        steps=1,
+        lambda_sem=0.0,
+        semantic_loss_weight=3.0,
+        attack_margin=0.0,
+        wandb_mode="disabled",
+        wandb_project="test",
+        log_images=False,
+        grid_save_policy="representative",
+        max_saved_grids=4,
+        save_original_images=False,
+        image_format="png",
+        image_quality=95,
+        image_save_workers=1,
+        eot=True,
+        strength_schedule=True,
+        num_anchor_tokens=3,
+        axis_lr=0.05,
+        train_strengths=(0.3, 1.0),
+        eval_strengths=(0.3, 0.7, 1.0),
+        legitimacy_ssim_threshold=0.4,
+        legitimacy_semantic_threshold=0.6,
+    )
+
+    config = run_fixed10_uap.build_stage_config(
+        args,
+        split="train",
+        images_per_class=1,
+        output_root=tmp_path / "out",
+        name="mixed13_axis_test",
+        steps=1,
+    )
+
+    assert config.attack.strength_schedule is True
+    assert config.attack.num_anchor_tokens == 3
+    assert config.attack.axis_lr == 0.05
+    assert config.attack.train_strengths == (0.3, 1.0)
+    assert config.attack.eval_strengths == (0.3, 0.7, 1.0)
+    assert config.attack.legitimacy_ssim_threshold == 0.4
+    assert config.attack.legitimacy_semantic_threshold == 0.6
+
+
+def test_run_name_appends_axis_suffix_when_strength_schedule_enabled() -> None:
+    args = Namespace(
+        run_name=None,
+        class_mode="mixed_13",
+        objective="margin_lpips",
+        lambda_sem=0.0,
+        semantic_loss_weight=3.0,
+        learnable_token_initializer="object",
+        global_batch_size=16,
+        attack_batch_size=None,
+        generator_batch_size=1,
+        epochs=1,
+        num_inference_steps=4,
+        num_tokens=8,
+        strength_schedule=True,
+        num_anchor_tokens=None,
+    )
+
+    name = run_fixed10_uap.run_name(args, train_ipc=20, test_ipc=20)
+
+    assert name.endswith("_axis4v4")

@@ -415,8 +415,10 @@ class TinyVictim:
 
 
 class TinySemantic:
-    def similarity(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
-        del right
+    def similarity(
+        self, left: torch.Tensor, right: torch.Tensor, labels: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        del right, labels
         return torch.ones(left.shape[0], device=left.device)
 
 
@@ -610,3 +612,176 @@ def test_initial_prompt_checkpoint_rejects_shape_mismatch(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match="token count mismatch"):
         runner._apply_initial_prompt_checkpoint(prompt_state)
+
+
+def test_axis_prompt_trains_anchor_and_axis_and_evaluates_with_strength_sweep(
+    tmp_path: Path,
+) -> None:
+    image_paths = []
+    for index in range(2):
+        path = tmp_path / f"axis_image_{index}.png"
+        Image.new("RGB", (16, 16), color=(128 + index, 128, 128)).save(path)
+        image_paths.append(path)
+    records = [
+        ImageRecord(
+            path=image_paths[0],
+            synset="class_0000",
+            class_label="class zero",
+            class_index=0,
+            image_id="axis_image_0",
+        ),
+        ImageRecord(
+            path=image_paths[1],
+            synset="class_0001",
+            class_label="class one",
+            class_index=1,
+            image_id="axis_image_1",
+        ),
+    ]
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        generator=replace(config.generator, name="mock", model_id="mock", batch_size=1),
+        attack=replace(
+            config.attack,
+            training_mode="universal",
+            batch_size=2,
+            steps=2,
+            num_learnable_tokens=6,
+            strength_schedule=True,
+            num_anchor_tokens=3,
+            train_strengths=(0.5, 1.0),
+            eval_strengths=(0.5, 1.0),
+        ),
+        output=replace(config.output, root=tmp_path / "outputs"),
+        quality=replace(config.quality, nriqa=replace(config.quality.nriqa, enabled=False)),
+    )
+    components = AttackComponents(
+        victim=TinyVictim(),
+        semantic=TinySemantic(),
+        dino_metric=None,
+        generator=MockEditableGenerator(device="cpu"),
+        quality_evaluator=EmptyQuality(),
+    )
+    runner = LearnableTokenAttackRunner(config, device="cpu")
+    initial_axis_base = None
+
+    axis_state, history = runner.train_universal_axis_prompt(
+        records,
+        components,
+        history_path=tmp_path / "history.csv",
+    )
+    initial_axis_base = axis_state.axis_base.clone()
+    rows = runner.evaluate_universal_axis_prompt(
+        records,
+        components,
+        axis_state,
+        stage="test",
+        metrics_path=tmp_path / "results.csv",
+    )
+
+    assert len(history) == 2
+    assert "success_rate_at_min_t" in history[0]
+    assert isinstance(axis_state.anchor_embeddings, torch.Tensor)
+    assert axis_state.anchor_embeddings.shape == (3, MockEditableGenerator.embedding_dim)
+    assert axis_state.axis_direction.shape == (3, MockEditableGenerator.embedding_dim)
+    # axis_base is a fixed buffer -- training must never mutate it.
+    assert torch.equal(axis_state.axis_base, initial_axis_base)
+    assert len(rows) == 2
+    for row in rows:
+        assert row["strength_schedule"] is True
+        assert row["num_anchor_tokens"] == 3
+        assert row["num_axis_tokens"] == 3
+        assert "sp_success" in row
+        assert "sp_first_success_strength" in row
+        assert row["first_success_step"] in {-1, 0, 1}
+        # Primary row fields must reflect the t=1.0 sweep point specifically.
+        assert row["eval_strengths"] == "0.5,1"
+
+
+def test_axis_prompt_checkpoint_round_trip_new_format(tmp_path: Path) -> None:
+    generator = MockEditableGenerator(device="cpu")
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        generator=replace(config.generator, name="mock", model_id="mock"),
+        attack=replace(
+            config.attack,
+            num_learnable_tokens=6,
+            strength_schedule=True,
+            num_anchor_tokens=3,
+        ),
+    )
+    runner = LearnableTokenAttackRunner(config, device="cpu")
+    axis_state = generator.create_axis_prompt(
+        class_label="object",
+        num_tokens=6,
+        num_anchor_tokens=3,
+        initializer="object",
+        init_std=0.02,
+    )
+    with torch.no_grad():
+        axis_state.anchor_embeddings.add_(1.0)
+        axis_state.axis_direction.add_(2.0)
+    runner.save_universal_prompt(axis_state, metadata={"run_name": "source"})
+
+    checkpoint_path = config.output.root / "prompt" / "learned_prompt.pt"
+    config = replace(config, attack=replace(config.attack, init_prompt_path=checkpoint_path))
+    runner = LearnableTokenAttackRunner(config, device="cpu")
+    fresh_state = generator.create_axis_prompt(
+        class_label="object",
+        num_tokens=6,
+        num_anchor_tokens=3,
+        initializer="object",
+        init_std=0.02,
+    )
+
+    loaded = runner._apply_initial_axis_prompt_checkpoint(fresh_state)
+
+    assert torch.allclose(loaded.anchor_embeddings.detach(), axis_state.anchor_embeddings.detach())
+    assert torch.allclose(loaded.axis_direction.detach(), axis_state.axis_direction.detach())
+    assert torch.allclose(loaded.axis_base, axis_state.axis_base)
+
+
+def test_axis_prompt_checkpoint_warm_starts_from_legacy_flat_format(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "learned_prompt.pt"
+    generator = MockEditableGenerator(device="cpu")
+    legacy_values = torch.arange(6 * generator.embedding_dim, dtype=torch.float32).reshape(
+        6, generator.embedding_dim
+    )
+    torch.save(
+        {
+            "token_texts": tuple(f"<v{i + 1}>" for i in range(6)),
+            "token_ids": tuple(range(6)),
+            "learnable_embeddings": legacy_values,
+            "metadata": {"run_name": "legacy_source"},
+        },
+        checkpoint_path,
+    )
+    config = load_config(Path("configs/flux2_resnet18.yaml"))
+    config = replace(
+        config,
+        generator=replace(config.generator, name="mock", model_id="mock"),
+        attack=replace(
+            config.attack,
+            num_learnable_tokens=6,
+            strength_schedule=True,
+            num_anchor_tokens=3,
+            init_prompt_path=checkpoint_path,
+        ),
+    )
+    runner = LearnableTokenAttackRunner(config, device="cpu")
+    fresh_state = generator.create_axis_prompt(
+        class_label="object",
+        num_tokens=6,
+        num_anchor_tokens=3,
+        initializer="object",
+        init_std=0.02,
+    )
+
+    loaded = runner._apply_initial_axis_prompt_checkpoint(fresh_state)
+
+    assert torch.allclose(loaded.anchor_embeddings.detach(), legacy_values[:3])
+    assert torch.allclose(loaded.axis_base, legacy_values[3:])
+    assert torch.all(loaded.axis_direction == 0)
+    assert loaded.axis_direction.requires_grad

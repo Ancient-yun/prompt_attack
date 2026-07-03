@@ -70,6 +70,66 @@ def test_smoke_override_uses_mock() -> None:
     assert not smoke.quality.fid.enabled
     assert not smoke.quality.nriqa.enabled
     assert smoke.data.images_per_class == 2
+    # Regression guard: with_smoke_overrides constructs a second explicit AttackConfig(...)
+    # that must thread through every new attack field, or smoke runs silently lose them.
+    assert smoke.attack.eot_train_seeds == config.attack.eot_train_seeds
+    assert smoke.attack.strength_schedule == config.attack.strength_schedule
+    assert smoke.attack.num_anchor_tokens == config.attack.num_anchor_tokens
+    assert smoke.attack.axis_lr == config.attack.axis_lr
+    assert smoke.attack.train_strengths == config.attack.train_strengths
+    assert smoke.attack.eval_strengths == config.attack.eval_strengths
+    assert smoke.attack.legitimacy_ssim_threshold == config.attack.legitimacy_ssim_threshold
+    assert (
+        smoke.attack.legitimacy_semantic_threshold == config.attack.legitimacy_semantic_threshold
+    )
+
+
+def test_load_config_parses_strength_schedule_fields(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+data:
+  imagenet_root: /data/imagenet
+generator:
+  name: flux2_klein_4b
+  model_id: dummy
+attack:
+  strength_schedule: true
+  num_anchor_tokens: 3
+  axis_lr: 0.05
+  train_strengths: "0.3,0.7,1.0"
+  eval_strengths: "0.2,0.5,1.0"
+  legitimacy_ssim_threshold: 0.4
+  legitimacy_semantic_threshold: 0.6
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.attack.strength_schedule is True
+    assert config.attack.num_anchor_tokens == 3
+    assert config.attack.axis_lr == 0.05
+    assert config.attack.train_strengths == (0.3, 0.7, 1.0)
+    assert config.attack.eval_strengths == (0.2, 0.5, 1.0)
+    assert config.attack.legitimacy_ssim_threshold == 0.4
+    assert config.attack.legitimacy_semantic_threshold == 0.6
+
+
+def test_attack_config_rejects_anchor_tokens_leaving_no_axis_room() -> None:
+    from prompt_attack.config import AttackConfig
+
+    with pytest.raises(ValueError, match="leave room for at least one axis token"):
+        AttackConfig(strength_schedule=True, num_learnable_tokens=4, num_anchor_tokens=4)
+
+
+def test_attack_config_auto_appends_missing_full_strength(recwarn: pytest.WarningsRecorder) -> None:
+    from prompt_attack.config import AttackConfig
+
+    config = AttackConfig(strength_schedule=True, eval_strengths=(0.2, 0.5))
+
+    assert config.eval_strengths == (0.2, 0.5, 1.0)
+    assert any("eval_strengths" in str(warning.message) for warning in recwarn.list)
 
 
 def test_parse_images_per_class_accepts_all() -> None:

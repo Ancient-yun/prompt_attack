@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from PIL import Image
+
+if TYPE_CHECKING:
+    from prompt_attack.attacks.axis_tokens import AxisPromptState
 
 
 @dataclass(frozen=True)
@@ -75,6 +78,21 @@ class EditableGenerator(Protocol):
 
     def sync_learnable_prompt_batch(self, prompt_state: LearnablePromptBatch) -> None:
         """Synchronize generator-owned token rows after batch optimizer updates."""
+
+    def create_axis_prompt(
+        self,
+        *,
+        class_label: str,
+        num_tokens: int,
+        num_anchor_tokens: int,
+        initializer: str,
+        init_std: float,
+        init_seed: int = 0,
+    ) -> "AxisPromptState":
+        """Create anchor/axis token embeddings for a strength-scheduled attack."""
+
+    def sync_axis_prompt(self, state: "AxisPromptState", *, t: float = 1.0) -> None:
+        """Synchronize generator-owned token rows for an axis prompt at strength ``t``."""
 
     def generate(
         self,

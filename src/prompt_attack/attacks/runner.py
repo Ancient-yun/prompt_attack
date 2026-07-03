@@ -16,6 +16,13 @@ from typing import Any
 
 from tqdm import tqdm
 
+from prompt_attack.attacks.axis_tokens import (
+    AxisPromptState,
+    build_axis_prompt_batch,
+    embeddings_at,
+    rank_weighted_strength_weights,
+    split_anchor_axis_tokens,
+)
 from prompt_attack.attacks.learnable_tokens import build_prompt
 from prompt_attack.attacks.losses import (
     attack_semantic_loss_weights,
@@ -766,6 +773,103 @@ class LearnableTokenAttackRunner:
         )
         return replace(prompt_state, learnable_embeddings=loaded_embeddings)
 
+    def create_universal_axis_prompt(self, components: AttackComponents) -> AxisPromptState:
+        """Create the shared anchor/axis prompt used by strength-scheduled attacks."""
+        num_anchor_tokens, _ = split_anchor_axis_tokens(
+            self.config.attack.num_learnable_tokens,
+            self.config.attack.num_anchor_tokens,
+        )
+        return components.generator.create_axis_prompt(
+            class_label="object",
+            num_tokens=self.config.attack.num_learnable_tokens,
+            num_anchor_tokens=num_anchor_tokens,
+            initializer=self.config.attack.learnable_token_initializer,
+            init_std=self.config.attack.learnable_token_init_std,
+            init_seed=self.config.attack.learnable_token_init_seed,
+        )
+
+    def _apply_initial_axis_prompt_checkpoint(self, axis_state: AxisPromptState) -> AxisPromptState:
+        """Replace a fresh axis prompt with a saved checkpoint (new or legacy format)."""
+        init_prompt_path = self.config.attack.init_prompt_path
+        if init_prompt_path is None:
+            return axis_state
+
+        import torch
+
+        checkpoint_path = Path(init_prompt_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Initial prompt checkpoint not found: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        if not isinstance(checkpoint, dict) or "learnable_embeddings" not in checkpoint:
+            raise ValueError(
+                "Initial prompt checkpoint must be a dict containing 'learnable_embeddings'."
+            )
+
+        expected_tokens = len(axis_state.token_texts)
+        checkpoint_token_texts = tuple(checkpoint.get("token_texts", ()))
+        if checkpoint_token_texts and len(checkpoint_token_texts) != expected_tokens:
+            raise ValueError(
+                "Initial prompt checkpoint token count mismatch: "
+                f"checkpoint has {len(checkpoint_token_texts)}, config expects {expected_tokens}."
+            )
+        if checkpoint_token_texts and checkpoint_token_texts != axis_state.token_texts:
+            raise ValueError(
+                "Initial prompt checkpoint token texts do not match the current prompt tokens."
+            )
+
+        anchor_device = axis_state.anchor_embeddings.device
+        anchor_dtype = axis_state.anchor_embeddings.dtype
+
+        if "anchor_embeddings" in checkpoint and "axis_direction" in checkpoint:
+            # New-format (format_version >= 2) checkpoint: load the three tensors directly.
+            saved_anchor = checkpoint["anchor_embeddings"]
+            saved_axis_base = checkpoint["axis_base"]
+            saved_axis_direction = checkpoint["axis_direction"]
+            for name, saved, current in (
+                ("anchor_embeddings", saved_anchor, axis_state.anchor_embeddings),
+                ("axis_base", saved_axis_base, axis_state.axis_base),
+                ("axis_direction", saved_axis_direction, axis_state.axis_direction),
+            ):
+                if tuple(saved.shape) != tuple(current.shape):
+                    raise ValueError(
+                        f"Initial prompt checkpoint '{name}' shape mismatch: "
+                        f"checkpoint has {tuple(saved.shape)}, current prompt expects "
+                        f"{tuple(current.shape)}."
+                    )
+            return replace(
+                axis_state,
+                anchor_embeddings=torch.nn.Parameter(
+                    saved_anchor.detach().clone().to(device=anchor_device, dtype=anchor_dtype)
+                ),
+                axis_base=saved_axis_base.detach().clone().to(device=anchor_device, dtype=anchor_dtype),
+                axis_direction=torch.nn.Parameter(
+                    saved_axis_direction.detach()
+                    .clone()
+                    .to(device=anchor_device, dtype=anchor_dtype)
+                ),
+            )
+
+        # Legacy flat-tensor checkpoint (pre-axis-mode run): warm-start by splitting the
+        # learned overlay into an anchor half and an axis-base half, with a zero-initialized
+        # axis direction (the old run recorded no direction information).
+        saved_embeddings = checkpoint["learnable_embeddings"]
+        if tuple(saved_embeddings.shape)[0] != expected_tokens:
+            raise ValueError(
+                "Legacy initial prompt checkpoint token count mismatch: "
+                f"checkpoint has {tuple(saved_embeddings.shape)[0]} rows, "
+                f"config expects {expected_tokens}."
+            )
+        num_anchor = axis_state.num_anchor_tokens
+        saved_embeddings = saved_embeddings.detach().clone().to(
+            device=anchor_device, dtype=anchor_dtype
+        )
+        return replace(
+            axis_state,
+            anchor_embeddings=torch.nn.Parameter(saved_embeddings[:num_anchor]),
+            axis_base=saved_embeddings[num_anchor:],
+            axis_direction=torch.nn.Parameter(torch.zeros_like(axis_state.axis_direction)),
+        )
+
     def train_universal_prompt(
         self,
         records: list[ImageRecord],
@@ -1006,6 +1110,296 @@ class LearnableTokenAttackRunner:
                 )
 
         return prompt_state, history
+
+    def train_universal_axis_prompt(
+        self,
+        records: list[ImageRecord],
+        components: AttackComponents,
+        *,
+        logger: WandbLogger | None = None,
+        history_path: Path | None = None,
+        dist_context: DistributedContext | None = None,
+    ) -> tuple[AxisPromptState, list[dict[str, Any]]]:
+        """Optimize an anchor/axis prompt with a multi-strength path-based loss.
+
+        Mirrors ``train_universal_prompt``, but at each micro-batch sweeps
+        ``attack.train_strengths`` along the learned axis direction (same seeds across
+        strengths within one step, so the strength axis is the only varying factor) and
+        weights each strength's loss with ``rank_weighted_strength_weights`` so an early
+        (small-``t``) successful crossing is rewarded more than pushing success out to
+        ``t=1`` -- discouraging the model from collapsing onto a single fixed-strength
+        overlay.
+        """
+        import torch
+
+        dist_context = dist_context or DistributedContext(
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            device=self.device,
+            backend="none",
+        )
+        if not records:
+            raise ValueError("Universal training requires at least one record.")
+        attack_loss_weight, semantic_loss_weight = attack_semantic_loss_weights(
+            self.config.attack.objective,
+            self.config.attack.lambda_sem,
+        )
+        axis_state = self._apply_initial_axis_prompt_checkpoint(
+            self.create_universal_axis_prompt(components)
+        )
+        anchor_embeddings = axis_state.anchor_embeddings
+        axis_direction = axis_state.axis_direction
+        if not isinstance(anchor_embeddings, torch.Tensor) or not isinstance(
+            axis_direction, torch.Tensor
+        ):
+            raise TypeError("Axis prompt state must expose torch.Tensor parameters.")
+        if not anchor_embeddings.requires_grad or not axis_direction.requires_grad:
+            raise RuntimeError("Axis prompt anchor/direction parameters must require gradients.")
+        dist_context.broadcast_tensor(anchor_embeddings.data)
+        dist_context.broadcast_tensor(axis_direction.data)
+        dist_context.broadcast_tensor(axis_state.axis_base)
+        components.generator.sync_axis_prompt(axis_state, t=1.0)
+
+        axis_lr = self.config.attack.axis_lr
+        optimizer = torch.optim.Adam(
+            [
+                {"params": [anchor_embeddings], "lr": self.config.attack.lr},
+                {"params": [axis_direction], "lr": axis_lr if axis_lr is not None else self.config.attack.lr},
+            ]
+        )
+        lr_scheduler = self._build_lr_scheduler(optimizer)
+        effective_batch_size = max(1, self.config.attack.batch_size)
+        micro_batch_size = max(1, self.config.generator.batch_size)
+        num_batches = len(self._record_batches(records, batch_size=effective_batch_size))
+        current_epoch = -1
+        batches: list[list[ImageRecord]] = []
+        history: list[dict[str, Any]] = []
+        train_started_at = time.perf_counter()
+        sorted_strengths = sorted(self.config.attack.train_strengths)
+        strength_weights = rank_weighted_strength_weights(sorted_strengths)
+
+        progress = tqdm(
+            range(self.config.attack.steps),
+            desc="uap-train",
+            disable=not dist_context.is_rank0,
+            dynamic_ncols=True,
+        )
+        for step in progress:
+            epoch = step // num_batches
+            if epoch != current_epoch:
+                current_epoch = epoch
+                batches = self._shuffled_record_batches(
+                    records,
+                    batch_size=effective_batch_size,
+                    epoch=epoch,
+                )
+            batch_index = step % num_batches
+            batch = batches[batch_index]
+            local_batch = dist_context.shard(batch)
+            optimizer.zero_grad(set_to_none=True)
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            step_attack_loss = 0.0
+            step_semantic_loss = 0.0
+            step_weighted_semantic_loss = 0.0
+            step_total_loss = 0.0
+            step_success = 0
+            step_success_min_t = 0
+            processed = 0
+
+            micro_batches = self._record_batches(local_batch, batch_size=micro_batch_size)
+            for (
+                micro_batch,
+                images,
+                original_tensor,
+                true_labels,
+            ) in self._prefetched_record_batches(
+                micro_batches,
+                enabled=True,
+            ):
+                if self.config.attack.eot_train_seeds:
+                    # Same rationale as the legacy loop's EOT handling: resample per step,
+                    # but keep it fixed across the strengths sampled *within* this step so
+                    # strength is the only thing varying in the sweep below.
+                    seeds = [
+                        stable_image_seed(step + 1, record.image_id) for record in micro_batch
+                    ]
+                else:
+                    seeds = [stable_image_seed(0, record.image_id) for record in micro_batch]
+
+                micro_attack_loss = 0.0
+                micro_semantic_loss = 0.0
+                micro_weighted_semantic_loss = 0.0
+                micro_total_loss = 0.0
+                micro_success_at_min_t = None
+                micro_success_at_max_t = 0
+                for weight_index, (t, weight) in enumerate(zip(sorted_strengths, strength_weights)):
+                    prompt_batch = build_axis_prompt_batch(axis_state, micro_batch, t=t)
+                    generated = components.generator.generate_batch(
+                        input_images=images,
+                        input_tensor=original_tensor,
+                        prompt_state=prompt_batch,
+                        seeds=seeds,
+                        require_grad=True,
+                    )
+                    image_tensor = generated.image_tensor
+                    if not isinstance(image_tensor, torch.Tensor):
+                        raise TypeError(
+                            "Generator batch result must expose torch.Tensor image_tensor."
+                        )
+                    logits = components.victim.logits_from_tensor(image_tensor)
+                    semantic_sim = (
+                        components.semantic.similarity(
+                            original_tensor, image_tensor, labels=true_labels
+                        )
+                        if semantic_loss_weight > 0
+                        else None
+                    )
+                    attack_losses, semantic_losses, weighted_semantic_losses, total_losses = (
+                        objective_loss_components(
+                            logits,
+                            true_labels,
+                            self.config.attack.objective,
+                            semantic_similarity=semantic_sim,
+                            lambda_sem=self.config.attack.lambda_sem,
+                            semantic_loss_weight=self.config.attack.semantic_loss_weight,
+                            attack_margin=self.config.attack.attack_margin,
+                        )
+                    )
+
+                    strength_loss = weight * total_losses.sum() / len(batch)
+                    if not torch.isfinite(strength_loss):
+                        raise FloatingPointError(
+                            f"Non-finite universal loss at step {step}, strength {t}"
+                        )
+                    strength_loss.backward()
+
+                    with torch.no_grad():
+                        eval_results = components.victim.evaluate_logits_batch(
+                            logits.detach(),
+                            true_labels.detach().cpu().tolist(),
+                        )
+                    success_count = sum(
+                        int(result.pred != record.class_index)
+                        for result, record in zip(eval_results, micro_batch)
+                    )
+                    if weight_index == 0:
+                        micro_success_at_min_t = success_count
+                    micro_success_at_max_t = success_count
+                    micro_attack_loss += float(attack_losses.detach().sum().cpu().item())
+                    micro_semantic_loss += float(semantic_losses.detach().sum().cpu().item())
+                    micro_weighted_semantic_loss += float(
+                        weighted_semantic_losses.detach().sum().cpu().item()
+                    )
+                    micro_total_loss += float(total_losses.detach().sum().cpu().item())
+
+                step_attack_loss += micro_attack_loss / len(sorted_strengths)
+                step_semantic_loss += micro_semantic_loss / len(sorted_strengths)
+                step_weighted_semantic_loss += micro_weighted_semantic_loss / len(sorted_strengths)
+                step_total_loss += micro_total_loss / len(sorted_strengths)
+                step_success += micro_success_at_max_t
+                step_success_min_t += micro_success_at_min_t or 0
+                processed += len(micro_batch)
+
+            for param in (anchor_embeddings, axis_direction):
+                if param.grad is None:
+                    param.grad = torch.zeros_like(param)
+                dist_context.all_reduce_sum(param.grad)
+            stats = torch.tensor(
+                [
+                    step_attack_loss,
+                    step_semantic_loss,
+                    step_weighted_semantic_loss,
+                    step_total_loss,
+                    step_success,
+                    step_success_min_t,
+                    processed,
+                ],
+                device=anchor_embeddings.device,
+                dtype=torch.float64,
+            )
+            dist_context.all_reduce_sum(stats)
+            global_processed = max(1.0, float(stats[6].detach().cpu().item()))
+            optimizer.step()
+            components.generator.sync_axis_prompt(axis_state, t=1.0)
+            if lr_scheduler is not None:
+                lr_scheduler.step()
+
+            history_row = {
+                "step": step,
+                "epoch": epoch,
+                "batch_index": batch_index,
+                "lr": current_lr,
+                "attack_loss": float(stats[0].detach().cpu().item()) / global_processed,
+                "semantic_loss": float(stats[1].detach().cpu().item()) / global_processed,
+                "weighted_semantic_loss": float(stats[2].detach().cpu().item()) / global_processed,
+                "total_loss": float(stats[3].detach().cpu().item()) / global_processed,
+                "success_rate": float(stats[4].detach().cpu().item()) / global_processed,
+                "success_rate_at_min_t": float(stats[5].detach().cpu().item()) / global_processed,
+                "train_strengths": ",".join(f"{value:g}" for value in sorted_strengths),
+                "effective_batch_size": len(batch),
+                "micro_batch_size": micro_batch_size,
+                "world_size": dist_context.world_size,
+            }
+            completed_steps = step + 1
+            elapsed, eta = _progress_eta(
+                started_at=train_started_at,
+                completed=completed_steps,
+                total=self.config.attack.steps,
+            )
+            if dist_context.is_rank0:
+                history.append(history_row)
+                set_process_title(
+                    _process_title(
+                        self.config,
+                        "train",
+                        step=f"{completed_steps}/{self.config.attack.steps}",
+                        asr=f"{history_row['success_rate']:.2f}",
+                        eta=_format_duration(eta),
+                    )
+                )
+                progress.set_postfix(
+                    {
+                        "loss": f"{history_row['total_loss']:.4f}",
+                        "asr": f"{history_row['success_rate']:.3f}",
+                        "asr_min_t": f"{history_row['success_rate_at_min_t']:.3f}",
+                        "lr": f"{current_lr:.2e}",
+                        "eta": _format_duration(eta),
+                    },
+                    refresh=True,
+                )
+                progress.write(
+                    "[train-axis] "
+                    f"step {completed_steps}/{self.config.attack.steps} "
+                    f"({completed_steps / self.config.attack.steps:.1%}) | "
+                    f"batch={history_row['batch_index'] + 1}/{len(batches)} | "
+                    f"loss={history_row['total_loss']:.4f} | "
+                    f"attack_loss={history_row['attack_loss']:.4f} | "
+                    f"asr@t1={history_row['success_rate']:.3f} | "
+                    f"asr@min_t={history_row['success_rate_at_min_t']:.3f} | "
+                    f"lr={current_lr:.2e} | "
+                    f"elapsed={_format_duration(elapsed)} | "
+                    f"eta={_format_duration(eta)}",
+                )
+            if history_path is not None and dist_context.is_rank0:
+                append_csv_row(history_path, history_row)
+            if logger is not None and dist_context.is_rank0:
+                logger.log_universal_step(
+                    attack_step=step,
+                    values={
+                        "attack_loss": history_row["attack_loss"],
+                        "semantic_loss": history_row["semantic_loss"],
+                        "weighted_semantic_loss": history_row["weighted_semantic_loss"],
+                        "total_loss": history_row["total_loss"],
+                        "lr": current_lr,
+                        "success_rate": history_row["success_rate"],
+                        "success_rate_at_min_t": history_row["success_rate_at_min_t"],
+                        "effective_batch_size": len(batch),
+                        "micro_batch_size": micro_batch_size,
+                    },
+                )
+
+        return axis_state, history
 
     def evaluate_universal_prompt(
         self,
@@ -1278,9 +1672,382 @@ class LearnableTokenAttackRunner:
             write_csv_rows(metrics_path, rows)
         return rows
 
+    def evaluate_universal_axis_prompt(
+        self,
+        records: list[ImageRecord],
+        components: AttackComponents,
+        axis_state: AxisPromptState,
+        *,
+        stage: str,
+        metrics_path: Path | None = None,
+        logger: WandbLogger | None = None,
+        show_progress: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Evaluate a frozen axis prompt by sweeping ``attack.eval_strengths``.
+
+        For each test image, generates once per configured strength (same seed across
+        strengths, deterministic) and records the earliest strength at which the attack
+        both succeeds and stays within the SSIM (and optional semantic) legitimacy gate --
+        the sweep-based analogue of MAELS' "earliest valid manifold crossing". The primary
+        row fields (``success``, ``ssim``, image paths, ...) are taken from the ``t=1.0``
+        sweep point specifically, so top-level ASR stays directly comparable to every prior
+        single-strength run.
+        """
+        import torch
+
+        rows: list[dict[str, Any]] = []
+        attack_loss_weight, semantic_loss_weight = attack_semantic_loss_weights(
+            self.config.attack.objective,
+            self.config.attack.lambda_sem,
+        )
+        batch_size = max(1, self.config.generator.batch_size)
+        batches = self._record_batches(records, batch_size=batch_size)
+        eval_started_at = time.perf_counter()
+        seen = 0
+        clean_correct_count = 0
+        success_count = 0
+        clean_success_count = 0
+        sorted_strengths = sorted(self.config.attack.eval_strengths)
+        primary_index = (
+            sorted_strengths.index(1.0)
+            if 1.0 in sorted_strengths
+            else len(sorted_strengths) - 1
+        )
+        progress = tqdm(
+            batches,
+            desc=f"{stage}-eval",
+            disable=not show_progress,
+            dynamic_ncols=True,
+        )
+        with self._image_writer() as image_writer:
+            prefetched_batches = self._prefetched_record_batches(
+                batches,
+                enabled=True,
+            )
+            for batch_index, (batch, images, original_tensor, true_labels) in enumerate(
+                prefetched_batches
+            ):
+                started_at = time.perf_counter()
+                seeds = [stable_image_seed(0, record.image_id) for record in batch]
+                with torch.no_grad():
+                    clean_logits = components.victim.logits_from_tensor(original_tensor)
+                    clean_evals = components.victim.evaluate_logits_batch(
+                        clean_logits,
+                        true_labels.detach().cpu().tolist(),
+                    )
+
+                sweep_results: list[dict[str, Any]] = []
+                for t in sorted_strengths:
+                    prompt_batch = build_axis_prompt_batch(axis_state, batch, t=t)
+                    generated = components.generator.generate_batch(
+                        input_images=images,
+                        input_tensor=original_tensor,
+                        prompt_state=prompt_batch,
+                        seeds=seeds,
+                        require_grad=False,
+                    )
+                    image_tensor = generated.image_tensor
+                    if not isinstance(image_tensor, torch.Tensor):
+                        raise TypeError(
+                            "Generator batch result must expose torch.Tensor image_tensor."
+                        )
+                    with torch.no_grad():
+                        adv_logits = components.victim.logits_from_tensor(image_tensor)
+                        adv_evals = components.victim.evaluate_logits_batch(
+                            adv_logits,
+                            true_labels.detach().cpu().tolist(),
+                        )
+                        semantic_sim = components.semantic.similarity(
+                            original_tensor, image_tensor, labels=true_labels
+                        )
+                        dino_metric_sim = (
+                            components.dino_metric.similarity(original_tensor, image_tensor)
+                            if components.dino_metric is not None
+                            else None
+                        )
+                        attack_losses, semantic_losses, weighted_semantic_losses, total_losses = (
+                            objective_loss_components(
+                                adv_logits,
+                                true_labels,
+                                self.config.attack.objective,
+                                semantic_similarity=semantic_sim,
+                                lambda_sem=self.config.attack.lambda_sem,
+                                semantic_loss_weight=self.config.attack.semantic_loss_weight,
+                                attack_margin=self.config.attack.attack_margin,
+                            )
+                        )
+                    ssim_values = [
+                        global_ssim(original_tensor[index : index + 1], image_tensor[index : index + 1])
+                        for index in range(len(batch))
+                    ]
+                    sweep_results.append(
+                        {
+                            "t": t,
+                            "image_tensor": image_tensor,
+                            "adv_evals": adv_evals,
+                            "semantic_sim": semantic_sim,
+                            "dino_metric_sim": dino_metric_sim,
+                            "attack_losses": attack_losses,
+                            "semantic_losses": semantic_losses,
+                            "weighted_semantic_losses": weighted_semantic_losses,
+                            "total_losses": total_losses,
+                            "ssim_values": ssim_values,
+                        }
+                    )
+
+                runtime_seconds = time.perf_counter() - started_at
+                primary = sweep_results[primary_index]
+                for index, record in enumerate(batch):
+                    clean_eval = clean_evals[index]
+                    legit_sweep_indices = []
+                    for sweep_index, sweep in enumerate(sweep_results):
+                        adv_eval_i = sweep["adv_evals"][index]
+                        success_i = adv_eval_i.pred != record.class_index
+                        ssim_i = sweep["ssim_values"][index]
+                        semantic_ok = True
+                        threshold = self.config.attack.legitimacy_semantic_threshold
+                        if threshold is not None:
+                            semantic_value_i = float(
+                                sweep["semantic_sim"][index].detach().cpu().item()
+                            )
+                            semantic_ok = semantic_value_i >= threshold
+                        if (
+                            success_i
+                            and ssim_i >= self.config.attack.legitimacy_ssim_threshold
+                            and semantic_ok
+                        ):
+                            legit_sweep_indices.append(sweep_index)
+                    sp_success = len(legit_sweep_indices) > 0
+                    best_sweep_index = (
+                        legit_sweep_indices[0]
+                        if sp_success
+                        else min(
+                            range(len(sweep_results)),
+                            key=lambda si: float(
+                                sweep_results[si]["attack_losses"][index].detach().cpu().item()
+                            ),
+                        )
+                    )
+                    best_sweep = sweep_results[best_sweep_index]
+                    sp_first_success_strength = (
+                        sorted_strengths[legit_sweep_indices[0]] if sp_success else None
+                    )
+                    true_confs = [sweep["adv_evals"][index].true_conf for sweep in sweep_results]
+                    margins = [sweep["adv_evals"][index].margin for sweep in sweep_results]
+                    min_true_conf_index = min(
+                        range(len(sweep_results)), key=lambda si: true_confs[si]
+                    )
+                    min_margin_index = min(range(len(sweep_results)), key=lambda si: margins[si])
+
+                    adv_eval = primary["adv_evals"][index]
+                    adv_image = tensor_to_pil(primary["image_tensor"][index : index + 1])
+                    output_dir = (
+                        self.config.output.root
+                        / "images"
+                        / stage
+                        / record.class_label
+                        / record.image_id
+                    )
+                    original_output_path, adv_output_path = self._save_eval_images(
+                        writer=image_writer,
+                        original=images[index],
+                        adversarial=adv_image,
+                        output_dir=output_dir,
+                    )
+                    original_row_path = (
+                        original_output_path
+                        if self.config.output.save_images
+                        and self.config.output.save_original_images
+                        else record.path
+                    )
+                    grid_path = self._grid_file_path(
+                        stage=stage,
+                        class_label=record.class_label,
+                        image_id=record.image_id,
+                    )
+                    grid_saved = self._save_grid_if_all_policy(
+                        writer=image_writer,
+                        original=images[index],
+                        adversarial=adv_image,
+                        grid_path=grid_path,
+                    )
+
+                    original_one = original_tensor[index : index + 1]
+                    adv_one = primary["image_tensor"][index : index + 1]
+                    success = adv_eval.pred != record.class_index
+                    clean_correct = clean_eval.pred == record.class_index
+                    semantic_value = float(primary["semantic_sim"][index].detach().cpu().item())
+                    dino_metric_value = (
+                        float(primary["dino_metric_sim"][index].detach().cpu().item())
+                        if primary["dino_metric_sim"] is not None
+                        else None
+                    )
+                    pixel_metrics = pixel_distance_metrics(original_one, adv_one)
+                    ssim = primary["ssim_values"][index]
+                    nriqa_metrics = (
+                        components.quality_evaluator.score_tensor(adv_one)
+                        if components.quality_evaluator is not None
+                        else {}
+                    )
+                    row = {
+                        "stage": stage,
+                        "training_mode": "universal",
+                        "image_id": record.image_id,
+                        "class_id": record.class_index,
+                        "class_label": record.class_label,
+                        "run_name": self.config.generator.name,
+                        "seed": seeds[index],
+                        "prompt_text": build_axis_prompt_batch(
+                            axis_state, [record], t=1.0
+                        ).prompt_texts[0],
+                        "num_learnable_tokens": self.config.attack.num_learnable_tokens,
+                        "num_anchor_tokens": axis_state.num_anchor_tokens,
+                        "num_axis_tokens": axis_state.num_axis_tokens,
+                        "strength_schedule": True,
+                        "eval_strengths": ",".join(f"{value:g}" for value in sorted_strengths),
+                        "legitimacy_ssim_threshold": self.config.attack.legitimacy_ssim_threshold,
+                        "legitimacy_semantic_threshold": (
+                            self.config.attack.legitimacy_semantic_threshold
+                            if self.config.attack.legitimacy_semantic_threshold is not None
+                            else ""
+                        ),
+                        "sp_success": sp_success,
+                        "sp_first_success_strength": (
+                            sp_first_success_strength if sp_first_success_strength is not None else ""
+                        ),
+                        "learnable_token_initializer": self.config.attack.learnable_token_initializer,
+                        "learnable_token_init_std": self.config.attack.learnable_token_init_std,
+                        "learnable_token_init_seed": self.config.attack.learnable_token_init_seed,
+                        "learnable_token_texts": " ".join(axis_state.token_texts),
+                        "lr": self.config.attack.lr,
+                        "axis_lr": self.config.attack.axis_lr or self.config.attack.lr,
+                        "lr_scheduler": self.config.attack.lr_scheduler.name,
+                        "lr_warmup_steps": self.config.attack.lr_scheduler.warmup_steps,
+                        "lr_min": self.config.attack.lr_scheduler.min_lr,
+                        "steps": self.config.attack.steps,
+                        "lambda_sem": self.config.attack.lambda_sem,
+                        "attack_loss_weight": attack_loss_weight,
+                        "semantic_loss_weight": _logged_semantic_weight(
+                            self.config,
+                            semantic_loss_weight,
+                        ),
+                        "attack_margin": self.config.attack.attack_margin,
+                        "objective": self.config.attack.objective,
+                        "attack_batch_size": self.config.attack.batch_size,
+                        "generator_height": self.config.generator.height,
+                        "generator_width": self.config.generator.width,
+                        "generator_batch_size": self.config.generator.batch_size,
+                        "num_inference_steps": self.config.generator.num_inference_steps,
+                        "clean_pred": clean_eval.pred,
+                        "clean_pred_label": components.victim.categories[clean_eval.pred],
+                        "clean_top1_conf": clean_eval.pred_conf,
+                        "clean_correct": clean_correct,
+                        "adv_pred": adv_eval.pred,
+                        "adv_pred_label": components.victim.categories[adv_eval.pred],
+                        "adv_top1_conf": adv_eval.pred_conf,
+                        "success": success,
+                        "clean_true_conf": clean_eval.true_conf,
+                        "adv_true_conf": adv_eval.true_conf,
+                        "confidence_drop": clean_eval.true_conf - adv_eval.true_conf,
+                        "clean_margin": clean_eval.margin,
+                        "adv_margin": adv_eval.margin,
+                        "margin_drop": clean_eval.margin - adv_eval.margin,
+                        **_semantic_metric_fields(
+                            components.semantic,
+                            semantic_value,
+                            dino_value=dino_metric_value,
+                        ),
+                        "semantic_loss": float(primary["semantic_losses"][index].detach().cpu().item()),
+                        "weighted_semantic_loss": float(
+                            primary["weighted_semantic_losses"][index].detach().cpu().item()
+                        ),
+                        "ssim": ssim,
+                        **pixel_metrics,
+                        **nriqa_metrics,
+                        "best_step": best_sweep_index,
+                        "best_attack_step": best_sweep_index,
+                        "first_success_step": legit_sweep_indices[0] if sp_success else -1,
+                        "min_adv_true_conf": true_confs[min_true_conf_index],
+                        "min_adv_true_conf_step": min_true_conf_index,
+                        "min_adv_margin": margins[min_margin_index],
+                        "min_adv_margin_step": min_margin_index,
+                        "best_attack_loss": float(
+                            best_sweep["attack_losses"][index].detach().cpu().item()
+                        ),
+                        "best_semantic_loss": float(
+                            best_sweep["semantic_losses"][index].detach().cpu().item()
+                        ),
+                        "best_weighted_semantic_loss": float(
+                            best_sweep["weighted_semantic_losses"][index].detach().cpu().item()
+                        ),
+                        "best_total_loss": float(
+                            best_sweep["total_losses"][index].detach().cpu().item()
+                        ),
+                        "runtime_seconds": runtime_seconds,
+                        "output_image_path": str(adv_output_path),
+                        "original_image_path": str(original_row_path),
+                        "grid_image_path": str(grid_path),
+                        "grid_saved": grid_saved,
+                    }
+                    if metrics_path is not None:
+                        append_csv_row(metrics_path, row)
+                    if logger is not None:
+                        logger.log_image_result(
+                            row=row, original=images[index], adversarial=adv_image
+                        )
+                    rows.append(row)
+                    seen += 1
+                    clean_correct_count += int(clean_correct)
+                    success_count += int(success)
+                    clean_success_count += int(clean_correct and success)
+                if show_progress:
+                    elapsed, eta = _progress_eta(
+                        started_at=eval_started_at,
+                        completed=batch_index + 1,
+                        total=len(batches),
+                    )
+                    asr = success_count / max(seen, 1)
+                    clean_asr = clean_success_count / max(clean_correct_count, 1)
+                    set_process_title(
+                        _process_title(
+                            self.config,
+                            f"{stage}-eval",
+                            images=f"{seen}/{len(records)}",
+                            asr=f"{asr:.2f}",
+                            eta=_format_duration(eta),
+                        )
+                    )
+                    progress.set_postfix(
+                        {
+                            "images": f"{seen}/{len(records)}",
+                            "asr": f"{asr:.3f}",
+                            "clean_asr": f"{clean_asr:.3f}",
+                            "eta": _format_duration(eta),
+                        },
+                        refresh=True,
+                    )
+                    progress.write(
+                        f"[{stage}] "
+                        f"batch {batch_index + 1}/{len(batches)} | "
+                        f"images={seen}/{len(records)} ({seen / max(len(records), 1):.1%}) | "
+                        f"clean_correct={clean_correct_count} | "
+                        f"success={success_count} | "
+                        f"asr={asr:.3f} | "
+                        f"clean_asr={clean_asr:.3f} | "
+                        f"elapsed={_format_duration(elapsed)} | "
+                        f"eta={_format_duration(eta)}",
+                    )
+        self._save_representative_grids(rows)
+        if (
+            metrics_path is not None
+            and self.config.output.grid_save_policy.lower() == "representative"
+        ):
+            write_csv_rows(metrics_path, rows)
+        return rows
+
     def save_universal_prompt(
         self,
-        prompt_state: LearnablePrompt,
+        prompt_state: LearnablePrompt | AxisPromptState,
         *,
         metadata: dict[str, Any],
     ) -> None:
@@ -1289,6 +2056,38 @@ class LearnableTokenAttackRunner:
 
         prompt_dir = self.config.output.root / "prompt"
         ensure_dir(prompt_dir)
+
+        if isinstance(prompt_state, AxisPromptState):
+            flat_embeddings = embeddings_at(prompt_state, t=1.0)
+            torch.save(
+                {
+                    "format_version": 2,
+                    "token_texts": prompt_state.token_texts,
+                    "token_ids": prompt_state.token_ids,
+                    "num_anchor_tokens": prompt_state.num_anchor_tokens,
+                    "num_axis_tokens": prompt_state.num_axis_tokens,
+                    "anchor_embeddings": prompt_state.anchor_embeddings.detach().cpu(),
+                    "axis_base": prompt_state.axis_base.detach().cpu(),
+                    "axis_direction": prompt_state.axis_direction.detach().cpu(),
+                    "learnable_embeddings": flat_embeddings.detach().cpu(),
+                    "metadata": metadata,
+                },
+                prompt_dir / "learned_prompt.pt",
+            )
+            write_json(
+                prompt_dir / "metadata.json",
+                {
+                    **metadata,
+                    "format_version": 2,
+                    "token_texts": list(prompt_state.token_texts),
+                    "token_ids": list(prompt_state.token_ids),
+                    "num_anchor_tokens": prompt_state.num_anchor_tokens,
+                    "num_axis_tokens": prompt_state.num_axis_tokens,
+                    "embedding_shape": list(flat_embeddings.shape),
+                },
+            )
+            return
+
         learnable_embeddings = prompt_state.learnable_embeddings
         if not isinstance(learnable_embeddings, torch.Tensor):
             raise TypeError("Universal prompt state must expose torch.Tensor learnable embeddings.")
@@ -1313,6 +2112,9 @@ class LearnableTokenAttackRunner:
 
     def run_universal(self, *, max_images: int | None = None) -> list[dict[str, Any]]:
         """Train one universal prompt and evaluate it on the same selected split."""
+        if self.config.attack.strength_schedule:
+            return self._run_universal_axis(max_images=max_images)
+
         ensure_dir(self.config.output.root)
         metrics_dir = self.config.output.root / "metrics"
         metrics_path = metrics_dir / "results.csv"
@@ -1365,6 +2167,70 @@ class LearnableTokenAttackRunner:
                     "semantic_loss_weight": self.config.attack.semantic_loss_weight,
                     "attack_margin": self.config.attack.attack_margin,
                     "lr": self.config.attack.lr,
+                },
+            )
+            logger.log_summary(summary)
+            return rows
+        finally:
+            logger.finish()
+
+    def _run_universal_axis(self, *, max_images: int | None = None) -> list[dict[str, Any]]:
+        """Train an anchor/axis prompt and evaluate it with a strength sweep."""
+        ensure_dir(self.config.output.root)
+        metrics_dir = self.config.output.root / "metrics"
+        metrics_path = metrics_dir / "results.csv"
+        history_path = metrics_dir / "train_history.csv"
+        summary_path = metrics_dir / "summary.json"
+        for path in (metrics_path, history_path, summary_path):
+            if path.exists():
+                path.unlink()
+
+        logger = WandbLogger(self.config)
+        logger.start()
+        try:
+            components = self.build_components()
+            records = self.prepare_records(components.victim, max_records=max_images)
+            if max_images is not None:
+                records = records[:max_images]
+            axis_state, history = self.train_universal_axis_prompt(
+                records,
+                components,
+                logger=logger,
+                history_path=history_path,
+            )
+            rows = self.evaluate_universal_axis_prompt(
+                records,
+                components,
+                axis_state,
+                stage=self.config.data.split or "data",
+                metrics_path=metrics_path,
+                logger=logger,
+            )
+            fid_value = compute_fid_for_rows(rows, self.config.quality.fid)
+            summary = asdict(summarize_rows(rows, fid=fid_value))
+            summary["training_mode"] = "universal"
+            summary["train_updates"] = len(history)
+            write_json(summary_path, summary)
+            self.save_universal_prompt(
+                axis_state,
+                metadata={
+                    "training_mode": "universal",
+                    "split": self.config.data.split,
+                    "record_count": len(records),
+                    "steps": self.config.attack.steps,
+                    "attack_batch_size": self.config.attack.batch_size,
+                    "generator_batch_size": self.config.generator.batch_size,
+                    "objective": self.config.attack.objective,
+                    "lambda_sem": self.config.attack.lambda_sem,
+                    "learnable_token_initializer": self.config.attack.learnable_token_initializer,
+                    "learnable_token_init_seed": self.config.attack.learnable_token_init_seed,
+                    "semantic_model": self.config.semantic.name,
+                    "semantic_loss_weight": self.config.attack.semantic_loss_weight,
+                    "attack_margin": self.config.attack.attack_margin,
+                    "lr": self.config.attack.lr,
+                    "axis_lr": self.config.attack.axis_lr or self.config.attack.lr,
+                    "train_strengths": list(self.config.attack.train_strengths),
+                    "eval_strengths": list(self.config.attack.eval_strengths),
                 },
             )
             logger.log_summary(summary)

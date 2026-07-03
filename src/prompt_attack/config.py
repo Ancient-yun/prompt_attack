@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -73,7 +74,37 @@ class AttackConfig:
     attack_margin: float = 0.0
     objective: str = "untargeted_margin"
     eot_train_seeds: bool = False
+    strength_schedule: bool = False
+    num_anchor_tokens: int | None = None
+    axis_lr: float | None = None
+    train_strengths: tuple[float, ...] = (0.2, 0.6, 1.0)
+    eval_strengths: tuple[float, ...] = (0.1, 0.3, 0.5, 0.7, 1.0)
+    legitimacy_ssim_threshold: float = 0.5
+    legitimacy_semantic_threshold: float | None = None
     lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
+
+    def __post_init__(self) -> None:
+        if not self.strength_schedule:
+            return
+        if self.num_anchor_tokens is not None and not (
+            0 < self.num_anchor_tokens < self.num_learnable_tokens
+        ):
+            raise ValueError(
+                "num_anchor_tokens must leave room for at least one axis token: "
+                f"got num_anchor_tokens={self.num_anchor_tokens}, "
+                f"num_learnable_tokens={self.num_learnable_tokens}."
+            )
+        if not self.train_strengths:
+            raise ValueError("train_strengths must contain at least one value.")
+        if not self.eval_strengths:
+            raise ValueError("eval_strengths must contain at least one value.")
+        if 1.0 not in self.eval_strengths:
+            warnings.warn(
+                "eval_strengths did not include 1.0; appending it so the legacy-comparable "
+                "full-strength row is always available.",
+                stacklevel=2,
+            )
+            object.__setattr__(self, "eval_strengths", (*self.eval_strengths, 1.0))
 
 
 @dataclass(frozen=True)
@@ -153,6 +184,15 @@ def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"Config section '{name}' must be a mapping.")
     return value
+
+
+def _parse_float_tuple(value: Any, *, default: tuple[float, ...]) -> tuple[float, ...]:
+    """Parse a comma-separated or sequence-valued list of floats."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return tuple(float(item.strip()) for item in value.split(",") if item.strip())
+    return tuple(float(item) for item in value)
 
 
 def parse_images_per_class(value: Any, *, default: int | None = 20) -> int | None:
@@ -295,6 +335,27 @@ def load_config(path: Path) -> ExperimentConfig:
             attack_margin=float(attack_raw.get("attack_margin", 0.0)),
             objective=str(attack_raw.get("objective", "untargeted_margin")),
             eot_train_seeds=bool(attack_raw.get("eot_train_seeds", False)),
+            strength_schedule=bool(attack_raw.get("strength_schedule", False)),
+            num_anchor_tokens=(
+                None
+                if attack_raw.get("num_anchor_tokens") in {None, ""}
+                else int(attack_raw.get("num_anchor_tokens"))
+            ),
+            axis_lr=(
+                None if attack_raw.get("axis_lr") in {None, ""} else float(attack_raw.get("axis_lr"))
+            ),
+            train_strengths=_parse_float_tuple(
+                attack_raw.get("train_strengths"), default=(0.2, 0.6, 1.0)
+            ),
+            eval_strengths=_parse_float_tuple(
+                attack_raw.get("eval_strengths"), default=(0.1, 0.3, 0.5, 0.7, 1.0)
+            ),
+            legitimacy_ssim_threshold=float(attack_raw.get("legitimacy_ssim_threshold", 0.5)),
+            legitimacy_semantic_threshold=(
+                None
+                if attack_raw.get("legitimacy_semantic_threshold") in {None, ""}
+                else float(attack_raw.get("legitimacy_semantic_threshold"))
+            ),
             lr_scheduler=LRSchedulerConfig(
                 name=str(lr_scheduler_raw.get("name", "fixed")),
                 warmup_steps=max(0, int(lr_scheduler_raw.get("warmup_steps", 0))),
@@ -391,6 +452,13 @@ def with_smoke_overrides(config: ExperimentConfig, *, use_mock_generator: bool) 
             attack_margin=config.attack.attack_margin,
             objective=config.attack.objective,
             eot_train_seeds=config.attack.eot_train_seeds,
+            strength_schedule=config.attack.strength_schedule,
+            num_anchor_tokens=config.attack.num_anchor_tokens,
+            axis_lr=config.attack.axis_lr,
+            train_strengths=config.attack.train_strengths,
+            eval_strengths=config.attack.eval_strengths,
+            legitimacy_ssim_threshold=config.attack.legitimacy_ssim_threshold,
+            legitimacy_semantic_threshold=config.attack.legitimacy_semantic_threshold,
             lr_scheduler=config.attack.lr_scheduler,
         ),
         quality=QualityConfig(

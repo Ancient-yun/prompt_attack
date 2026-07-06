@@ -27,6 +27,7 @@ from prompt_attack.attacks.learnable_tokens import build_prompt
 from prompt_attack.attacks.losses import (
     attack_semantic_loss_weights,
     is_margin_dino_constraint_objective,
+    is_saturating_ce_constraint_objective,
     is_semantic_only_objective,
     objective_loss_components,
 )
@@ -105,6 +106,8 @@ def _short_objective_label(objective: str) -> str:
         "margin_lpips_img2img": "mlpips",
         "margin_oracle": "moracle",
         "margin_oracle_clip": "moracle",
+        "sat_ce_oracle": "satce",
+        "saturating_ce_oracle": "satce",
         "cr": "cr",
     }
     return labels.get(normalized, normalized[:10])
@@ -165,7 +168,9 @@ def _logged_semantic_weight(config: ExperimentConfig, objective_weight: float) -
     """Return the semantic loss weight that actually scales the configured objective."""
     if is_semantic_only_objective(config.attack.objective):
         return 1.0
-    if is_margin_dino_constraint_objective(config.attack.objective):
+    if is_margin_dino_constraint_objective(config.attack.objective) or (
+        is_saturating_ce_constraint_objective(config.attack.objective)
+    ):
         return config.attack.semantic_loss_weight
     return objective_weight
 

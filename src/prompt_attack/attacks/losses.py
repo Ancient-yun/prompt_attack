@@ -68,6 +68,23 @@ def cr_loss(logits, true_label: Any, *, reduction: str = "mean"):
     return negative_cross_entropy_loss(logits, true_label, reduction=reduction)
 
 
+def saturating_ce_loss(logits, true_label: Any, *, reduction: str = "mean"):
+    """Return the MAELS saturating cross-entropy attack loss for minimization.
+
+    ``L = -log(1 - e^{-CE(logits, true_label)})`` (arXiv:2402.03095, Eq. 8, attack term
+    with lambda_h = 1). Minimizing drives CE up (untargeted fooling) and saturates toward 0
+    once the victim is confidently wrong, mirroring the bounded behaviour of the margin
+    hinge. Uses ``expm1`` for an accurate ``1 - e^{-CE}`` at small CE, floored for stability.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    target = _target_tensor(logits, true_label)
+    ce = F.cross_entropy(logits, target, reduction="none")
+    one_minus = (-torch.expm1(-ce)).clamp_min(1e-6)  # 1 - e^{-CE}, floored to bound the loss
+    return _reduce_loss(-torch.log(one_minus), reduction)
+
+
 def _normalized_objective(objective: str) -> str:
     return objective.lower().replace("-", "_")
 
@@ -104,6 +121,22 @@ def is_margin_dino_constraint_objective(objective: str) -> bool:
         "margin_lpips_img2img",
         "margin_oracle",
         "margin_oracle_clip",
+    }
+
+
+def is_saturating_ce_constraint_objective(objective: str) -> bool:
+    """Return whether the objective uses the MAELS saturating-CE attack plus a semantic guard.
+
+    Same structure as the margin-constraint family (attack term + semantic preservation
+    term summed), but the attack term is the paper's saturating CE instead of margin hinge.
+    """
+    return _normalized_objective(objective) in {
+        "sat_ce",
+        "sat_ce_oracle",
+        "sat_ce_dino",
+        "sat_ce_lpips",
+        "saturating_ce",
+        "saturating_ce_oracle",
     }
 
 
@@ -166,6 +199,8 @@ def attack_loss_from_objective(logits, true_label: Any, objective: str, *, reduc
         return cr_loss(logits, true_label, reduction=reduction)
     if is_margin_dino_constraint_objective(objective):
         return margin_hinge_loss(logits, true_label, reduction=reduction)
+    if is_saturating_ce_constraint_objective(objective):
+        return saturating_ce_loss(logits, true_label, reduction=reduction)
     if normalized in {
         "negative_cross_entropy",
         "neg_cross_entropy",
@@ -193,6 +228,8 @@ def attack_semantic_loss_weights(objective: str, lambda_sem: float) -> tuple[flo
     if is_semantic_only_objective(objective):
         return 0.0, 1.0
     if is_margin_dino_constraint_objective(objective):
+        return 1.0, 1.0
+    if is_saturating_ce_constraint_objective(objective):
         return 1.0, 1.0
     return 1.0 - lambda_sem, lambda_sem
 
@@ -238,6 +275,15 @@ def objective_loss_components(
             margin=attack_margin,
             reduction="none",
         )
+        semantic_losses = semantic_image_loss(semantic_similarity, reduction="none")
+        weighted_semantic_losses = semantic_loss_weight * semantic_losses
+        total_losses = attack_losses + weighted_semantic_losses
+        return attack_losses, semantic_losses, weighted_semantic_losses, total_losses
+
+    if is_saturating_ce_constraint_objective(objective):
+        if semantic_similarity is None:
+            raise ValueError(f"{objective} requires image-to-image semantic similarity.")
+        attack_losses = saturating_ce_loss(logits, true_label, reduction="none")
         semantic_losses = semantic_image_loss(semantic_similarity, reduction="none")
         weighted_semantic_losses = semantic_loss_weight * semantic_losses
         total_losses = attack_losses + weighted_semantic_losses

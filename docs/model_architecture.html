@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>모델 아키텍처 — Semantic-Preserving Adversarial Attack</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a22; --panel2:#1e222c; --border:#2a2f3a;
+    --text:#e6e8ee; --muted:#9aa2b1; --accent:#5b9dff; --good:#3ecf8e;
+    --warn:#f5a524; --bad:#ff6b6b; --collapse:#c678dd;
+    --frozen:#3a4152; --learn:#5b9dff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Malgun Gothic",sans-serif;
+    line-height:1.6;font-size:15px}
+  .wrap{max-width:1040px;margin:0 auto;padding:32px 20px 80px}
+  header h1{font-size:26px;margin:0 0 6px}
+  header .sub{color:var(--muted);font-size:14px}
+  h2{font-size:19px;margin:38px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+  h3{font-size:15px;margin:22px 0 8px;color:var(--accent)}
+  p{margin:8px 0}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px 18px;margin:14px 0}
+  .tablewrap{overflow-x:auto;margin:12px 0}
+  table{border-collapse:collapse;width:100%;min-width:640px;font-size:13.5px}
+  th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+  thead th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+  tbody tr:hover{background:#1b1f29}
+  .pill{display:inline-block;padding:1px 8px;border-radius:20px;font-size:12px;font-weight:600}
+  .pill.frozen{background:rgba(154,162,177,.16);color:var(--muted)}
+  .pill.learn{background:rgba(91,157,255,.18);color:var(--accent)}
+  .pill.high{background:rgba(255,107,107,.16);color:var(--bad)}
+  .pill.low{background:rgba(62,207,142,.14);color:var(--good)}
+  .bad{color:var(--bad)} .good{color:var(--good)} .warn{color:var(--warn)} .muted{color:var(--muted)}
+  .flag{border-left:3px solid var(--accent);background:var(--panel2);padding:10px 14px;border-radius:0 8px 8px 0;margin:12px 0}
+  .flag.warn{border-color:var(--warn)}
+  .flag.bad{border-color:var(--bad)}
+  .flag.good{border-color:var(--good)}
+  code{background:#0b0d12;border:1px solid var(--border);border-radius:5px;padding:1px 6px;font-size:12.5px;
+    font-family:"SF Mono",Consolas,monospace}
+  pre{background:#0b0d12;border:1px solid var(--border);border-radius:8px;padding:12px 16px;overflow-x:auto;
+    font-size:13px;font-family:"SF Mono",Consolas,monospace;color:#c9d1d9}
+  ol,ul{margin:8px 0;padding-left:22px} li{margin:5px 0}
+  .foot{color:var(--muted);font-size:12px;margin-top:40px;border-top:1px solid var(--border);padding-top:14px}
+
+  /* --- architecture diagram --- */
+  .diagram{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:22px 18px;margin:18px 0;overflow-x:auto}
+  .flow{display:flex;align-items:stretch;gap:0;min-width:760px}
+  .col{display:flex;flex-direction:column;justify-content:center;gap:10px}
+  .col.inputs{flex:0 0 210px}
+  .col.arrow{flex:0 0 46px;align-items:center;justify-content:center}
+  .col.gen{flex:0 0 150px;align-items:center;justify-content:center}
+  .col.out{flex:0 0 140px;align-items:center;justify-content:center}
+  .col.judges{flex:0 0 200px}
+  .node{border-radius:9px;padding:10px 12px;font-size:13px;border:1px solid var(--border);background:var(--panel2)}
+  .node .role{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px}
+  .node .name{font-weight:600}
+  .node .desc{font-size:11.5px;color:var(--muted);margin-top:3px;line-height:1.4}
+  .node.frozen{border-color:#3a4152;background:#191d27}
+  .node.learn{border-color:var(--learn);background:rgba(91,157,255,.08);box-shadow:0 0 0 1px rgba(91,157,255,.15)}
+  .node.gen{text-align:center;background:#191d27;border-color:#3a4152;padding:18px 12px;width:100%}
+  .node.attack{border-color:var(--bad);background:rgba(255,107,107,.07)}
+  .node.preserve{border-color:var(--good);background:rgba(62,207,142,.07)}
+  .arrow-line{color:var(--muted);font-size:22px;line-height:1}
+  .legend-row{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;font-size:12px;color:var(--muted)}
+  .legend-row .chip{display:inline-flex;align-items:center;gap:6px}
+  .swatch{width:12px;height:12px;border-radius:3px;display:inline-block;border:1px solid var(--border)}
+  .swatch.frozen{background:#191d27}
+  .swatch.learn{background:rgba(91,157,255,.25);border-color:var(--learn)}
+  .walkbar{display:flex;align-items:center;gap:2px;margin:6px 0}
+  .tstep{flex:1;height:10px;border-radius:2px;background:var(--panel2);border:1px solid var(--border)}
+  .tstep.cross{background:var(--good);border-color:var(--good)}
+  .tstep.after{background:rgba(198,120,221,.35);border-color:var(--collapse)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>모델 아키텍처 — 정체성 보존 적대적 공격</h1>
+  <div class="sub">MAELS(arXiv:2402.03095) latent 분해를 frozen 사전학습 모델 위에 이식 &nbsp;·&nbsp; victim: ResNet-18 mixed_13 &nbsp;·&nbsp; generator: FLUX.2-klein</div>
+</header>
+
+<div class="card">
+  <p><strong>목표.</strong> victim classifier(ResNet)는 <span class="bad">오분류</span>시키되, 이미지의 <span class="good">정체성은 보존</span>한다 —
+  즉 "개를 다른 클래스로 오인시키되, 사람 눈(과 CLIP)에는 여전히 개로 보이게". 픽셀에 노이즈를 얹는 고전 UAP가 아니라,
+  <strong>생성모델의 semantic 편집 축을 따라 걷는(walk)</strong> 방식으로 이걸 달성한다.</p>
+</div>
+
+<h2>1. 한눈에 — 무엇이 frozen이고 무엇을 학습하나</h2>
+<p>MAELS는 z를 z1/z2/z3로 나누고 네 네트워크(E·G·Q·D)를 InfoGAN으로 <strong>함께 학습</strong>한다. 우리 세팅에서는 이 넷이 전부
+<strong>이미 존재하는 frozen 사전학습 모델</strong>로 대체되고, <strong>학습 대상은 z3(연속 semantic 축) 토큰 하나로 줄어든다.</strong></p>
+
+<div class="tablewrap"><table>
+<thead><tr><th>MAELS</th><th>역할</th><th>우리의 대체물</th><th>학습?</th></tr></thead>
+<tbody>
+<tr><td><strong>z1</strong> (noise, identity)</td><td>정체성·외형</td><td>입력 이미지 latent</td><td><span class="pill frozen">frozen</span> 입력이 곧 z1</td></tr>
+<tr><td><strong>z2</strong> (label code)</td><td>클래스 라벨</td><td>텍스트 <code>"a photo of {class}"</code></td><td><span class="pill frozen">frozen</span> 고정 텍스트</td></tr>
+<tr><td><strong>z3</strong> (semantic 축)</td><td>클래스 내 연속 변형</td><td><strong>learnable token</strong> <code>z3_base + t·direction</code></td><td><span class="pill learn">학습</span> <strong>유일한 학습 대상</strong></td></tr>
+<tr><td><strong>E</strong></td><td>이미지 → z1</td><td>FLUX VAE encoder</td><td><span class="pill frozen">frozen</span></td></tr>
+<tr><td><strong>G</strong></td><td>(z1,z2,z3) → 이미지</td><td>FLUX.2 transformer</td><td><span class="pill frozen">frozen</span></td></tr>
+<tr><td><strong>Q</strong></td><td>이미지 → 라벨 (정체성 감시)</td><td><strong>CLIP zero-shot</strong></td><td><span class="pill frozen">frozen</span></td></tr>
+<tr><td><strong>D</strong></td><td>진짜/가짜 판별</td><td>불필요</td><td>—</td></tr>
+</tbody>
+</table></div>
+
+<h2>2. 아키텍처 흐름</h2>
+<div class="diagram">
+  <div class="flow">
+    <div class="col inputs">
+      <div class="node frozen"><div class="role">z1 · identity</div><div class="name">입력 이미지 x</div><div class="desc">VAE로 인코딩 → 정체성·구도 담당 (E)</div></div>
+      <div class="node frozen"><div class="role">z2 · label</div><div class="name">"a photo of {class}"</div><div class="desc">고정 텍스트 = 라벨 코드</div></div>
+      <div class="node learn"><div class="role">z3 · semantic 축</div><div class="name">learnable token</div><div class="desc">z3_base + <strong>t</strong>·direction<br>(direction만 학습)</div></div>
+    </div>
+    <div class="col arrow"><div class="arrow-line">▶</div></div>
+    <div class="col gen">
+      <div class="node gen frozen"><div class="role">G · frozen</div><div class="name">FLUX.2</div><div class="desc">image editing</div></div>
+    </div>
+    <div class="col arrow"><div class="arrow-line">▶</div></div>
+    <div class="col out">
+      <div class="node frozen" style="text-align:center;width:100%"><div class="role">출력</div><div class="name">x<sup>SO</sup>(t)</div><div class="desc">강도 t로 편집된 이미지</div></div>
+    </div>
+    <div class="col arrow"><div class="arrow-line">▶</div></div>
+    <div class="col judges">
+      <div class="node attack"><div class="role">공격 · F</div><div class="name">victim ResNet</div><div class="desc">정답을 <span class="bad">틀리게</span> 만들기<br>(margin hinge loss)</div></div>
+      <div class="node preserve"><div class="role">보존 · Q</div><div class="name">CLIP zero-shot</div><div class="desc">여전히 <span class="good">정답</span>으로 읽히게<br>(oracle 정답확률)</div></div>
+    </div>
+  </div>
+  <div class="legend-row">
+    <span class="chip"><span class="swatch frozen"></span> frozen 사전학습 (학습 안 함)</span>
+    <span class="chip"><span class="swatch learn"></span> 학습되는 부분 (z3 direction만)</span>
+    <span class="chip"><span style="color:var(--bad)">■</span> victim = 속일 대상</span>
+    <span class="chip"><span style="color:var(--good)">■</span> CLIP = 정체성 감시자</span>
+  </div>
+</div>
+
+<h2>3. 컴포넌트 설명</h2>
+
+<h3>z1 = 입력 이미지 (토큰이 아니다)</h3>
+<p>MAELS의 z1은 <code>E(z1|x)</code> — 이미지마다 다른 per-image 정체성 코드다. FLUX는 image-editing 모델이라
+<strong>입력 이미지 자체가 이미 이 역할</strong>을 한다. 그래서 정체성을 담는 별도 토큰이 필요 없다.
+정체성 보존이 자연스럽게 <strong>t의 함수</strong>가 된다: 낮은 t = 이미지 지배(정체성↑), 높은 t = z3 지배(정체성↓).</p>
+
+<h3>z2 = 클래스 텍스트</h3>
+<p><code>"a photo of {class_label}"</code>가 discrete 라벨 코드. untargeted 공격에서 z2는 정답에 고정된 채, victim을 그 정답에서 밀어낸다.</p>
+
+<h3>z3 = 학습되는 유일한 것</h3>
+<p>learnable textual-inversion token <code>&lt;v1&gt;…&lt;vN&gt;</code>을 <code>z3_base + t·direction</code>으로 파라미터화한다.
+<strong>direction만 gradient로 학습</strong>되고, <strong>t는 주입 강도를 조절하는 스칼라 다이얼</strong>(0=편집 없음, 1=최대).</p>
+
+<h3>Q = CLIP (frozen, victim과 독립)</h3>
+<div class="flag good"><strong>왜 CLIP인가 — 학습해서가 아니라 "victim과 독립"이라서.</strong>
+공격의 본질은 "F(ResNet)는 틀리는데 Q는 맞는" 간극을 찾는 것이다. 이 간극은 F와 Q가 충분히 다를 때만 존재한다.
+CLIP은 아키텍처·학습데이터·feature가 ResNet과 전혀 달라서, ResNet을 속인 이미지도 CLIP은 정답으로 읽을 수 있다.
+(만약 Q를 victim과 비슷하게 학습하면 Q≈F가 되어 간극이 사라지고 보존 성공률이 0이 된다 — 그래서 <strong>CLIP frozen을 쓴다.</strong>)</div>
+
+<h2>4. 손실 함수</h2>
+<p>각 강도 t에서 생성한 <code>x<sup>SO</sup>(t)</code>에 대해 두 항을 계산한다:</p>
+<div class="tablewrap"><table>
+<thead><tr><th>항</th><th>수식</th><th>의미</th></tr></thead>
+<tbody>
+<tr><td><span class="bad">공격</span></td><td><code>relu(z_true − max z_other)</code></td><td>victim margin hinge. 이미 뒤집힌 샘플은 loss 0 → 최소 변화로 딱 경계까지만.</td></tr>
+<tr><td><span class="good">보존</span></td><td><code>1 − CLIP_prob(true class)</code></td><td>CLIP이 여전히 정답을 읽도록. 픽셀(SSIM)이 아니라 <strong>의미</strong>로 정체성 감시 → 포즈·시점 변화 허용.</td></tr>
+</tbody>
+</table></div>
+<pre>L(t) = relu( z_true(t) − max z_other(t) )  +  w · ( 1 − CLIP_prob(x^SO(t), true) )
+         └─────── 공격 (victim 속이기) ──────┘      └──── 보존 (CLIP 정체성 감시) ────┘</pre>
+<p class="muted">여러 강도 t에서 이 loss를 구해 <strong>낮은 t일수록 큰 가중치</strong>로 합산한다 — "약한 편집으로도 성공하면 더 보상"해서
+필요 이상으로 밀어붙이는 붕괴를 억제한다.</p>
+<div class="flag"><strong>공격 항은 두 후보가 있다.</strong> 위 margin hinge는 우리 현재 선택이고, MAELS 논문은 포화형 CE를 쓴다.
+어느 쪽이 정체성 보존에 유리한지는 <a href="#loss-compare" style="color:var(--accent)">§7 비교 실험 계획</a>에서 실측으로 가른다.</div>
+
+<h2>5. Strength walk — 가장 이른 정당한 crossing을 채택</h2>
+<p>MAELS가 z3를 작은 스텝으로 walk하며 <strong>victim이 처음 틀리는 지점</strong>을 고르는 것을 그대로 따른다.
+평가 시 t를 0→1로 훑으며, <strong>victim이 틀림 AND CLIP은 여전히 정답</strong>을 만족하는 <strong>가장 작은 t</strong>를 채택한다.</p>
+<div class="card">
+  <div class="walkbar">
+    <div class="tstep"></div><div class="tstep"></div><div class="tstep cross" title="여기서 채택"></div>
+    <div class="tstep after"></div><div class="tstep after"></div><div class="tstep after"></div>
+  </div>
+  <div class="legend-row" style="margin-top:4px">
+    <span class="chip"><span class="swatch" style="background:var(--panel2)"></span> t 낮음 — 아직 victim 못 속임</span>
+    <span class="chip"><span class="swatch" style="background:var(--good);border-color:var(--good)"></span> 최초 성공 + 정체성 유지 → <strong>채택</strong></span>
+    <span class="chip"><span class="swatch" style="background:rgba(198,120,221,.4);border-color:var(--collapse)"></span> 더 밀면 붕괴 (버림)</span>
+  </div>
+</div>
+<p class="muted">이 "최소 강도 채택"이 핵심이다 — 끝까지(t=1) 밀면 대부분 붕괴하지만, 그 이전 어딘가에서 멈추면 정체성이 보존된 진짜 편집이 나온다.</p>
+
+<h2>6. 왜 이 설계인가 — 핵심 통찰</h2>
+<ol>
+  <li><strong>4-network InfoGAN → frozen 3-model + 학습 z3.</strong> G를 새로 학습하지 않으니 E·G·Q·D가 전부 사전학습 모델로 대체되고, 학습은 z3 direction 하나로 축소된다.</li>
+  <li><strong>정체성은 픽셀이 아니라 의미로 지킨다.</strong> LPIPS/SSIM 같은 픽셀 제약은 나쁜 overlay뿐 아니라 좋은 semantic 편집(포즈·시점)까지 막는다. CLIP oracle은 "큰 변화라도 정답으로 읽히면 OK".</li>
+  <li><strong>CLIP의 힘은 victim과의 독립성에서 나온다.</strong> 같은 계열(DINO 등) guard는 victim과 함께 속아서 실패했다. CLIP은 독립적이라 간극을 만든다.</li>
+  <li><strong>walk로 최소 강도를 고른다.</strong> "가장 세게 속이기"가 아니라 "가장 약하게, 정체성 유지하며 속이기"를 목표로 삼아 붕괴를 피한다.</li>
+</ol>
+
+<div class="flag warn"><strong>알려진 한계 (다음 과제).</strong> 실측(§9, SP-ASR 26.5%)에서 성공의 상당수가 여전히 붕괴(collapse)해 소수 클래스로 몰린다.
+전이 분석 결과 이 쏠림은 대체로 <strong>붕괴한 것들이 몇 개 sink로 몰린 현상</strong>이었고, 진짜 보존 성공은 더 고루 퍼져 있었다.
+따라서 다음 지렛대는 loss 형태나 targeted 전환이 아니라 <strong>collapse 자체를 줄이는 것</strong>(oracle 압력 강화, t=0 재구성 앵커, 성공 샘플 masking)이다.</div>
+
+<h2 id="loss-compare">7. 손실 함수 비교 실험 계획 — 우리 margin vs 논문 CE</h2>
+<p>현재 공격 항은 margin hinge지만, MAELS 논문(Eq.8)은 <strong>포화형 cross-entropy</strong>를 쓴다. 둘 다 <strong>untargeted</strong>지만
+gradient 성질이 달라서, 어느 쪽이 정체성 보존에 유리한지 <strong>같은 조건에서 attack 항만 바꿔</strong> 실측으로 가른다.</p>
+
+<h3>7.1 두 공격 항</h3>
+<div class="tablewrap"><table>
+<thead><tr><th></th><th>우리 (현재, margin hinge)</th><th>논문 (MAELS, 포화형 CE)</th></tr></thead>
+<tbody>
+<tr><td>수식</td><td><code>relu(z_true − max z_other + m)</code></td><td><code>−λ<sub>h</sub>·log(1 − e<sup>−CE(F, y)</sup>)</code></td></tr>
+<tr><td>기반</td><td>logit margin (2등 클래스와의 차이)</td><td>softmax CE (정답 클래스 확률)</td></tr>
+<tr><td>gradient 분포</td><td>민주적 — 안 뒤집힌 모든 샘플에 균등</td><td>stubborn 우선 — victim이 확신할수록 큰 gradient</td></tr>
+<tr><td>멈추는 지점</td><td class="good">결정경계 (최소 변화로 딱 넘김)</td><td class="warn">확신 오분류까지 (경계 넘어 더 밀어붙임)</td></tr>
+<tr><td>보존 관점 예상</td><td class="good">유리</td><td class="warn">불리할 수 있음</td></tr>
+<tr><td>targeted?</td><td>untargeted</td><td>untargeted</td></tr>
+</tbody>
+</table></div>
+<pre>우리:  L_atk(t) = relu( z_true(t) − max z_other(t) + m )        # 뒤집히면 즉시 0 → 최소 변화
+논문:  L_atk(t) = −λ_h · log( 1 − e^(−CE(F(x^SO(t)), y)) )      # 뒤집혀도 정답확률 낮출 때까지
+공통:  L(t)     = L_atk(t) + w·( 1 − CLIP_prob(x^SO(t), true) ) # 보존 항(CLIP oracle)은 동일</pre>
+
+<h3>7.2 가설</h3>
+<ul>
+  <li><strong>논문 CE는 경계를 넘어 더 밀어붙인다</strong>(뒤집힌 뒤에도 정답확률을 계속 낮춤) → raw ASR은 같거나 높지만 <strong>collapse가 더 많고 SP-ASR(보존)은 낮을 것</strong>.</li>
+  <li><strong>우리 hinge는 경계에서 멈춘다</strong>(최소 변화) → 보존에 유리 → <strong>SP-ASR ≥ 논문 CE</strong>일 것.</li>
+  <li>단, 평가 walk가 최소 t를 고르므로 학습 loss의 "얼마나 넘어가나" 효과가 일부 상쇄될 수 있음 → 실제 차이는 예상보다 작을 수도 있다.</li>
+</ul>
+
+<h3>7.3 실험 설계 (통제)</h3>
+<p>mixed_13 · ipc20 · e5 · <code>clip_oracle</code> guard(w=0.5) · strength-schedule · 32 tokens — <strong>전부 고정하고 오직 attack 항만 교체</strong>한다.</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Run</th><th>attack 항</th><th>상태</th></tr></thead>
+<tbody>
+<tr><td>A (margin)</td><td>margin hinge</td><td><span class="pill low">이미 있음</span> §9의 <code>mixed13_oracle_axis_w0p5_ipc20_gb16_e5</code> 재사용</td></tr>
+<tr><td>B (CE)</td><td>포화형 CE</td><td><span class="pill learn">신규</span> objective 구현 후 qlab e5 실행</td></tr>
+</tbody>
+</table></div>
+<p class="muted">구현: <code>losses.py</code>에 포화형-CE attack term 함수 + objective(예: <code>sat_ce_oracle</code>) 등록,
+oracle 보존 항은 그대로. <code>λ_h</code>는 우리 hinge scale에 맞춰 1부터 시작(필요 시 튜닝). 코드 ~1시간 + 실행 ~78분.</p>
+
+<h3>7.4 비교 지표 & 판정</h3>
+<div class="tablewrap"><table>
+<thead><tr><th>지표</th><th>보는 것</th></tr></thead>
+<tbody>
+<tr><td><strong>SP-ASR</strong> (oracle-preserved)</td><td><strong>주 지표</strong> — 진짜 보존 성공률</td></tr>
+<tr><td>collapse rate</td><td>raw success − preserved. 논문 CE가 더 클 것으로 예상</td></tr>
+<tr><td>mean/median first_success_strength</td><td>어느 쪽이 더 낮은 t에서 성공하나 (최소 변화)</td></tr>
+<tr><td>crossing 지점 SSIM / CLIP-prob</td><td>실제 채택 지점의 보존 품질 (t=1.0 아님)</td></tr>
+<tr><td>dominant-target 집중도 (top-3 %)</td><td>쏠림이 loss에 따라 달라지나</td></tr>
+<tr><td>residual cosine</td><td>overlay 회귀 여부</td></tr>
+</tbody>
+</table></div>
+<div class="flag good"><strong>판정.</strong> SP-ASR이 유의미하게 높은 쪽을 채택한다. 비슷하면 "우리 hinge가 논문 재현 부담 없이 동등"으로 확정.
+논문 CE가 더 높으면 "경계에서 멈추는 게 보존에 유리하다"는 우리 분석이 틀렸다는 뜻이므로 재검토한다.</div>
+
+<div class="foot">
+  코드 진입점: <code>scripts/run_uap.py --strength-schedule --objective margin_oracle --semantic-model clip_oracle</code> ·
+  핵심 모듈: <code>src/prompt_attack/attacks/axis_tokens.py</code>, <code>models/semantic.py (ClipZeroShotOracle)</code> ·
+  실험 결과: <code>docs/mixed13_results_summary.html</code> (§9)
+</div>
+</div>
+</body>
+</html>
